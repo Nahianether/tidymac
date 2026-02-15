@@ -5,6 +5,7 @@ use eframe::egui;
 
 use crate::cleaner::ScanResult;
 use crate::disk_info::{self, DiskInfo};
+use crate::monitor::Monitor;
 use crate::utils;
 
 // ── Color palette ──────────────────────────────────────────────────────
@@ -149,6 +150,7 @@ pub struct TidyMacApp {
     cleaned_bytes: u64,
     about_visible: bool,
     disk_info: Option<DiskInfo>,
+    monitor: Option<Monitor>,
 }
 
 // ── App impl ───────────────────────────────────────────────────────────
@@ -250,6 +252,7 @@ impl TidyMacApp {
             cleaned_bytes: 0,
             about_visible: false,
             disk_info: disk_info::get_disk_info(),
+            monitor: Monitor::new(),
         }
     }
 
@@ -374,6 +377,9 @@ impl TidyMacApp {
                         self.phase = AppPhase::Idle;
                         self.progress_label.clear();
                         self.disk_info = disk_info::get_disk_info();
+                        if let Some(ref mut mon) = self.monitor {
+                            mon.refresh();
+                        }
                     }
                 }
             }
@@ -1394,6 +1400,10 @@ impl TidyMacApp {
 impl eframe::App for TidyMacApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_messages();
+
+        if let Some(ref mut mon) = self.monitor {
+            mon.tick();
+        }
 
         if self.phase != AppPhase::Idle {
             ctx.request_repaint();
