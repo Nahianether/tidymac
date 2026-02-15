@@ -891,6 +891,91 @@ impl TidyMacApp {
             });
     }
 
+    fn render_scan_dashboard(&self, ui: &mut egui::Ui) {
+        // Only show after a scan has been performed
+        let has_scan = self.categories.iter().any(|c| c.scan_result.is_some());
+        if !has_scan || self.phase == AppPhase::Scanning {
+            return;
+        }
+
+        // Collect categories with data, sorted by size
+        let mut bars: Vec<(&str, egui::Color32, u64)> = self
+            .categories
+            .iter()
+            .filter_map(|c| {
+                let total = c.scan_result.as_ref()?.total_bytes;
+                if total == 0 {
+                    return None;
+                }
+                Some((c.label, c.icon_color, total))
+            })
+            .collect();
+
+        if bars.is_empty() {
+            return;
+        }
+
+        bars.sort_by(|a, b| b.2.cmp(&a.2));
+        let max_size = bars[0].2 as f64;
+
+        egui::Frame::NONE
+            .fill(CARD_FILL)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(0.5, BORDER))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                ui.label(
+                    egui::RichText::new("Scan Results")
+                        .size(12.0)
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                ui.add_space(6.0);
+
+                let available_w = ui.available_width();
+
+                for (label, color, size) in &bars {
+                    let bar_frac = *size as f64 / max_size;
+                    let bar_w = (available_w * bar_frac as f32).max(40.0);
+                    let bar_h = 20.0;
+
+                    ui.horizontal(|ui| {
+                        // Painted bar
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(bar_w, bar_h),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(bar_rect, 4.0, *color);
+
+                        // Label on top of bar
+                        let text_pos = bar_rect.left_center() + egui::vec2(6.0, 0.0);
+                        painter.text(
+                            text_pos,
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::WHITE,
+                        );
+
+                        // Size to the right
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(utils::format_size(*size))
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                    });
+
+                    ui.add_space(2.0);
+                }
+            });
+
+        ui.add_space(6.0);
+    }
+
     fn render_summary(&self, ui: &mut egui::Ui) {
         let total: u64 = self
             .categories
@@ -1329,6 +1414,7 @@ impl eframe::App for TidyMacApp {
                 self.render_header(ui);
                 self.render_disk_bar(ui);
                 self.render_action_bar(ui);
+                self.render_scan_dashboard(ui);
                 self.render_category_list(ui);
                 self.render_summary(ui);
                 self.render_errors(ui);
