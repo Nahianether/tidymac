@@ -3,6 +3,7 @@ use std::sync::mpsc;
 
 use eframe::egui;
 
+use crate::analyzer::AppInfo;
 use crate::cleaner::ScanResult;
 use crate::disk_info::{self, DiskInfo};
 use crate::monitor::Monitor;
@@ -125,6 +126,13 @@ pub enum BgMessage {
     AllCleansComplete,
     AllShredsComplete,
     Progress(String),
+    AnalyzerComplete(Vec<AppInfo>),
+}
+
+#[derive(PartialEq)]
+pub enum ViewMode {
+    Main,
+    Analyzer,
 }
 
 #[derive(PartialEq)]
@@ -153,6 +161,10 @@ pub struct TidyMacApp {
     about_visible: bool,
     disk_info: Option<DiskInfo>,
     monitor: Option<Monitor>,
+    view_mode: ViewMode,
+    analyzer_apps: Vec<AppInfo>,
+    analyzer_expanded: Vec<bool>,
+    analyzer_scanning: bool,
 }
 
 // ── App impl ───────────────────────────────────────────────────────────
@@ -235,7 +247,7 @@ impl TidyMacApp {
                 expanded: false,
                 scan_result: None,
                 entry_selected: vec![],
-                is_report_only: c.name() == "large-files" || c.name() == "old-files",
+                is_report_only: c.name() == "large-files",
             }})
             .collect();
 
@@ -256,6 +268,10 @@ impl TidyMacApp {
             about_visible: false,
             disk_info: disk_info::get_disk_info(),
             monitor: Monitor::new(),
+            view_mode: ViewMode::Main,
+            analyzer_apps: vec![],
+            analyzer_expanded: vec![],
+            analyzer_scanning: false,
         }
     }
 
@@ -384,6 +400,12 @@ impl TidyMacApp {
                             mon.refresh();
                         }
                     }
+                    BgMessage::AnalyzerComplete(apps) => {
+                        self.analyzer_expanded = vec![false; apps.len()];
+                        self.analyzer_apps = apps;
+                        self.analyzer_scanning = false;
+                        self.progress_label.clear();
+                    }
                 }
             }
         }
@@ -480,7 +502,19 @@ impl TidyMacApp {
     fn render_header(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.add_space(ui.available_width() - 50.0);
+            // App Analyzer button (left side)
+            let analyzer_btn = egui::Button::new(
+                egui::RichText::new("App Analyzer")
+                    .size(12.0)
+                    .color(ACCENT),
+            )
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(100.0, 24.0));
+            if ui.add(analyzer_btn).on_hover_text("Analyze application sizes").clicked() {
+                self.view_mode = ViewMode::Analyzer;
+            }
+
+            ui.add_space(ui.available_width() - 30.0);
             let about_btn = egui::Button::new(
                 egui::RichText::new("i")
                     .size(14.0)
@@ -1483,6 +1517,316 @@ impl TidyMacApp {
         }
     }
 
+    fn start_analyzer_scan(&mut self) {
+        self.analyzer_scanning = true;
+        self.analyzer_apps.clear();
+        self.analyzer_expanded.clear();
+        self.progress_label = "Scanning applications...".to_string();
+
+        let (tx, rx) = mpsc::channel::<BgMessage>();
+        self.receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let progress = |msg: &str| {
+                let _ = tx.send(BgMessage::Progress(msg.to_string()));
+            };
+            let apps = crate::analyzer::scan_applications(&progress);
+            let _ = tx.send(BgMessage::AnalyzerComplete(apps));
+        });
+    }
+
+    fn render_analyzer_view(&mut self, ui: &mut egui::Ui) {
+        // Header
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let back_btn = egui::Button::new(
+                egui::RichText::new("<  Back")
+                    .size(13.0)
+                    .color(ACCENT),
+            )
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(80.0, 30.0));
+            if ui.add(back_btn).clicked() {
+                self.view_mode = ViewMode::Main;
+            }
+
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("App Size Analyzer")
+                    .size(22.0)
+                    .strong()
+                    .color(TITLE_BLUE),
+            );
+        });
+
+        ui.add_space(8.0);
+
+        // Scan button
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            let scan_btn = egui::Button::new(
+                egui::RichText::new("Scan Applications")
+                    .size(14.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(if self.analyzer_scanning {
+                egui::Color32::from_rgb(40, 70, 100)
+            } else {
+                egui::Color32::from_rgb(45, 120, 200)
+            })
+            .corner_radius(egui::CornerRadius::same(8))
+            .min_size(egui::vec2(160.0, 34.0));
+
+            if ui.add_enabled(!self.analyzer_scanning, scan_btn).clicked() {
+                self.start_analyzer_scan();
+            }
+
+            if !self.analyzer_apps.is_empty() {
+                ui.add_space(12.0);
+                let total: u64 = self.analyzer_apps.iter().map(|a| a.total_size).sum();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} apps  |  Total: {}",
+                        self.analyzer_apps.len(),
+                        utils::format_size(total)
+                    ))
+                    .size(12.0)
+                    .color(TEXT_SECONDARY),
+                );
+            }
+        });
+
+        // Progress
+        if self.analyzer_scanning {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let t = (ui.input(|i| i.time) % 2.0) as f32 / 2.0;
+                let bar = egui::ProgressBar::new(t)
+                    .animate(true)
+                    .desired_width(ui.available_width() - 16.0);
+                ui.add(bar);
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&self.progress_label)
+                        .size(12.0)
+                        .color(TEXT_SECONDARY),
+                );
+            });
+        }
+
+        ui.add_space(8.0);
+
+        if self.analyzer_apps.is_empty() && !self.analyzer_scanning {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(
+                    egui::RichText::new("Click \"Scan Applications\" to analyze app sizes")
+                        .size(14.0)
+                        .color(TEXT_SECONDARY),
+                );
+            });
+            return;
+        }
+
+        // App list
+        let max_size = self.analyzer_apps.first().map(|a| a.total_size).unwrap_or(1);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for i in 0..self.analyzer_apps.len() {
+                    Self::render_app_row(
+                        ui,
+                        &self.analyzer_apps[i],
+                        &mut self.analyzer_expanded[i],
+                        max_size,
+                    );
+                    ui.add_space(3.0);
+                }
+            });
+    }
+
+    fn render_app_row(
+        ui: &mut egui::Ui,
+        app: &AppInfo,
+        expanded: &mut bool,
+        max_size: u64,
+    ) {
+        let card_fill = if *expanded { CARD_EXPANDED } else { CARD_FILL };
+
+        egui::Frame::NONE
+            .fill(card_fill)
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .stroke(egui::Stroke::new(0.5, BORDER))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                // Header row
+                ui.horizontal(|ui| {
+                    // App icon badge
+                    let badge_size = 26.0;
+                    let (badge_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(badge_size, badge_size),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(
+                        badge_rect,
+                        6.0,
+                        egui::Color32::from_rgb(60, 60, 80),
+                    );
+                    let initial = app.name.chars().next().unwrap_or('?');
+                    painter.text(
+                        badge_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        initial.to_string(),
+                        egui::FontId::proportional(13.0),
+                        ACCENT,
+                    );
+
+                    ui.add_space(4.0);
+
+                    let arrow = if *expanded { "\u{25BC}" } else { "\u{25B6}" };
+                    if ui
+                        .selectable_label(
+                            false,
+                            egui::RichText::new(format!("{} {}", arrow, app.name))
+                                .size(13.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        )
+                        .clicked()
+                    {
+                        *expanded = !*expanded;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(utils::format_size(app.total_size))
+                                .size(13.0)
+                                .strong()
+                                .color(GREEN),
+                        );
+                    });
+                });
+
+                // Size bar
+                let bar_frac = app.total_size as f32 / max_size as f32;
+                let bar_w = (ui.available_width() * bar_frac).max(4.0);
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
+                ui.painter().rect_filled(bar_rect, 3.0, ACCENT);
+
+                // Expanded breakdown
+                if !*expanded {
+                    return;
+                }
+
+                ui.add_space(6.0);
+
+                egui::Frame::NONE
+                    .fill(INSET_FILL)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        // Breakdown bars
+                        let parts = [
+                            ("Binary (MacOS)", app.binary_size, egui::Color32::from_rgb(100, 160, 230)),
+                            ("Resources", app.resources_size, egui::Color32::from_rgb(80, 190, 120)),
+                            ("Frameworks", app.frameworks_size, egui::Color32::from_rgb(220, 140, 60)),
+                            ("Other", app.other_size, egui::Color32::from_rgb(140, 140, 160)),
+                        ];
+
+                        let part_max = parts
+                            .iter()
+                            .map(|(_, s, _)| *s)
+                            .max()
+                            .unwrap_or(1)
+                            .max(1);
+
+                        for (label, size, color) in &parts {
+                            if *size == 0 {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                let frac = *size as f32 / part_max as f32;
+                                let w = ((ui.available_width() - 120.0) * frac).max(4.0);
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(w, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(r, 3.0, *color);
+
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}: {}",
+                                        label,
+                                        utils::format_size(*size)
+                                    ))
+                                    .size(11.0)
+                                    .color(TEXT_SECONDARY),
+                                );
+                            });
+                            ui.add_space(2.0);
+                        }
+
+                        ui.add_space(6.0);
+
+                        // Action buttons
+                        ui.horizontal(|ui| {
+                            let reveal_btn = egui::Button::new(
+                                egui::RichText::new("Reveal in Finder")
+                                    .size(11.0)
+                                    .color(ACCENT),
+                            )
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .min_size(egui::vec2(110.0, 24.0));
+                            if ui.add(reveal_btn).clicked() {
+                                let _ = std::process::Command::new("open")
+                                    .arg("-R")
+                                    .arg(&app.path)
+                                    .spawn();
+                            }
+
+                            ui.add_space(8.0);
+
+                            let trash_btn = egui::Button::new(
+                                egui::RichText::new("Move to Trash")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(220, 100, 100)),
+                            )
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .min_size(egui::vec2(110.0, 24.0));
+                            if ui
+                                .add(trash_btn)
+                                .on_hover_text("Move this app to Trash")
+                                .clicked()
+                            {
+                                // Use macOS `trash` command via osascript
+                                let path_str = app.path.to_string_lossy().to_string();
+                                let script = format!(
+                                    "tell application \"Finder\" to delete POSIX file \"{}\"",
+                                    path_str
+                                );
+                                let _ = std::process::Command::new("osascript")
+                                    .arg("-e")
+                                    .arg(&script)
+                                    .spawn();
+                            }
+                        });
+                    });
+            });
+    }
+
     fn render_errors(&self, ui: &mut egui::Ui) {
         if self.errors.is_empty() {
             return;
@@ -1523,7 +1867,7 @@ impl eframe::App for TidyMacApp {
             mon.tick();
         }
 
-        if self.phase != AppPhase::Idle {
+        if self.phase != AppPhase::Idle || self.analyzer_scanning {
             ctx.request_repaint();
         }
 
@@ -1541,13 +1885,20 @@ impl eframe::App for TidyMacApp {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
-                self.render_header(ui);
-                self.render_disk_bar(ui);
-                self.render_action_bar(ui);
-                self.render_scan_dashboard(ui);
-                self.render_category_list(ui);
-                self.render_summary(ui);
-                self.render_errors(ui);
+                match self.view_mode {
+                    ViewMode::Main => {
+                        self.render_header(ui);
+                        self.render_disk_bar(ui);
+                        self.render_action_bar(ui);
+                        self.render_scan_dashboard(ui);
+                        self.render_category_list(ui);
+                        self.render_summary(ui);
+                        self.render_errors(ui);
+                    }
+                    ViewMode::Analyzer => {
+                        self.render_analyzer_view(ui);
+                    }
+                }
             });
     }
 }
