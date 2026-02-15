@@ -2945,6 +2945,7 @@ version = "0.2.0"
 dependencies = [
  "dirs",
  "eframe",
+ "libc",
  "walkdir",
 ]
 

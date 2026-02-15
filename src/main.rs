@@ -1,6 +1,7 @@
 mod app;
 mod categories;
 mod cleaner;
+mod disk_info;
 mod utils;
 
 use eframe::egui;

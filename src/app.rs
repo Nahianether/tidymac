@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use eframe::egui;
 
 use crate::cleaner::ScanResult;
+use crate::disk_info::{self, DiskInfo};
 use crate::utils;
 
 // ── Color palette ──────────────────────────────────────────────────────
@@ -143,6 +144,7 @@ pub struct TidyMacApp {
     errors: Vec<String>,
     cleaned_bytes: u64,
     about_visible: bool,
+    disk_info: Option<DiskInfo>,
 }
 
 // ── App impl ───────────────────────────────────────────────────────────
@@ -243,6 +245,7 @@ impl TidyMacApp {
             errors: vec![],
             cleaned_bytes: 0,
             about_visible: false,
+            disk_info: disk_info::get_disk_info(),
         }
     }
 
@@ -366,6 +369,7 @@ impl TidyMacApp {
                     BgMessage::AllCleansComplete => {
                         self.phase = AppPhase::Idle;
                         self.progress_label.clear();
+                        self.disk_info = disk_info::get_disk_info();
                     }
                 }
             }
@@ -438,6 +442,96 @@ impl TidyMacApp {
             ui.painter().rect_filled(rect, 1.0, ACCENT);
         });
         ui.add_space(12.0);
+    }
+
+    fn render_disk_bar(&self, ui: &mut egui::Ui) {
+        let Some(ref info) = self.disk_info else {
+            return;
+        };
+
+        egui::Frame::NONE
+            .fill(CARD_FILL)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(0.5, BORDER))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                // Labels row
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Disk Usage")
+                            .size(12.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} free of {}",
+                                utils::format_size(info.available),
+                                utils::format_size(info.total),
+                            ))
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                        );
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                // Bar
+                let bar_height = 14.0;
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), bar_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+
+                // Background (free space)
+                painter.rect_filled(bar_rect, 7.0, egui::Color32::from_rgb(40, 40, 55));
+
+                // Used portion
+                let pct = info.usage_percent();
+                let used_width = bar_rect.width() * pct;
+                let used_rect = egui::Rect::from_min_size(
+                    bar_rect.min,
+                    egui::vec2(used_width, bar_height),
+                );
+
+                let bar_color = if pct < 0.6 {
+                    GREEN
+                } else if pct < 0.8 {
+                    YELLOW
+                } else {
+                    egui::Color32::from_rgb(220, 60, 60)
+                };
+                painter.rect_filled(used_rect, 7.0, bar_color);
+
+                ui.add_space(4.0);
+
+                // Used / Total text
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Used: {}",
+                            utils::format_size(info.used),
+                        ))
+                        .size(11.0)
+                        .color(bar_color),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}%", pct * 100.0))
+                                .size(11.0)
+                                .strong()
+                                .color(bar_color),
+                        );
+                    });
+                });
+            });
+
+        ui.add_space(6.0);
     }
 
     fn render_action_bar(&mut self, ui: &mut egui::Ui) {
@@ -1231,6 +1325,7 @@ impl eframe::App for TidyMacApp {
             )
             .show(ctx, |ui| {
                 self.render_header(ui);
+                self.render_disk_bar(ui);
                 self.render_action_bar(ui);
                 self.render_category_list(ui);
                 self.render_summary(ui);
