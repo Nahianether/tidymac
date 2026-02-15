@@ -1091,41 +1091,47 @@ impl TidyMacApp {
                 ui.add_space(6.0);
 
                 let available_w = ui.available_width();
+                let label_w = 130.0;
+                let size_w = 70.0;
+                let bar_area = (available_w - label_w - size_w - 12.0).max(40.0);
 
                 for (label, color, size) in &bars {
                     let bar_frac = *size as f64 / max_size;
-                    let bar_w = (available_w * bar_frac as f32).max(40.0);
-                    let bar_h = 20.0;
+                    let bar_w = (bar_area * bar_frac as f32).max(4.0);
+                    let bar_h = 14.0;
 
                     ui.horizontal(|ui| {
-                        // Painted bar
+                        // Label on the left, fixed width
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(label_w, bar_h),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(*label)
+                                        .size(11.0)
+                                        .color(TEXT_PRIMARY),
+                                );
+                            },
+                        );
+
+                        // Color bar
                         let (bar_rect, _) = ui.allocate_exact_size(
                             egui::vec2(bar_w, bar_h),
                             egui::Sense::hover(),
                         );
-                        let painter = ui.painter();
-                        painter.rect_filled(bar_rect, 4.0, *color);
+                        ui.painter().rect_filled(bar_rect, 3.0, *color);
 
-                        // Label on top of bar
-                        let text_pos = bar_rect.left_center() + egui::vec2(6.0, 0.0);
-                        painter.text(
-                            text_pos,
-                            egui::Align2::LEFT_CENTER,
-                            label,
-                            egui::FontId::proportional(10.0),
-                            egui::Color32::WHITE,
-                        );
-
-                        // Size to the right
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new(utils::format_size(*size))
-                                .size(11.0)
-                                .color(TEXT_SECONDARY),
-                        );
+                        // Size on the right
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(utils::format_size(*size))
+                                    .size(11.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                        });
                     });
 
-                    ui.add_space(2.0);
+                    ui.add_space(1.0);
                 }
             });
 
