@@ -38,6 +38,7 @@ fn icon_for_category(name: &str) -> (&'static str, egui::Color32) {
         "trash" => ("T", egui::Color32::from_rgb(190, 60, 60)),
         "ds-store" => (".", egui::Color32::from_rgb(140, 140, 160)),
         "language-files" => ("i", egui::Color32::from_rgb(50, 180, 180)),
+        "privacy" => ("R", egui::Color32::from_rgb(220, 70, 70)),
         "old-files" => ("O", egui::Color32::from_rgb(200, 160, 50)),
         "large-files" => ("F", egui::Color32::from_rgb(200, 80, 200)),
         _ => ("?", egui::Color32::from_rgb(140, 140, 160)),
