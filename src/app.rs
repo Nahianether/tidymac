@@ -161,6 +161,7 @@ pub struct TidyMacApp {
     about_visible: bool,
     disk_info: Option<DiskInfo>,
     monitor: Option<Monitor>,
+    monitor_enabled: bool,
     view_mode: ViewMode,
     analyzer_apps: Vec<AppInfo>,
     analyzer_expanded: Vec<bool>,
@@ -267,7 +268,8 @@ impl TidyMacApp {
             cleaned_bytes: 0,
             about_visible: false,
             disk_info: disk_info::get_disk_info(),
-            monitor: Monitor::new(),
+            monitor: None,
+            monitor_enabled: false,
             view_mode: ViewMode::Main,
             analyzer_apps: vec![],
             analyzer_expanded: vec![],
@@ -512,6 +514,27 @@ impl TidyMacApp {
             .min_size(egui::vec2(100.0, 24.0));
             if ui.add(analyzer_btn).on_hover_text("Analyze application sizes").clicked() {
                 self.view_mode = ViewMode::Analyzer;
+            }
+
+            ui.add_space(4.0);
+
+            // Monitor toggle button
+            let mon_label = if self.monitor_enabled { "Monitor: ON" } else { "Monitor: OFF" };
+            let mon_color = if self.monitor_enabled { GREEN } else { TEXT_SECONDARY };
+            let mon_btn = egui::Button::new(
+                egui::RichText::new(mon_label)
+                    .size(11.0)
+                    .color(mon_color),
+            )
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(90.0, 24.0));
+            if ui.add(mon_btn).on_hover_text("Toggle menu bar disk monitor").clicked() {
+                self.monitor_enabled = !self.monitor_enabled;
+                if self.monitor_enabled {
+                    self.monitor = Monitor::new();
+                } else {
+                    self.monitor = None;
+                }
             }
 
             ui.add_space(ui.available_width() - 30.0);

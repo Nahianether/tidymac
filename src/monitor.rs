@@ -11,20 +11,46 @@ pub struct Monitor {
     last_update: std::time::Instant,
 }
 
-fn create_icon() -> Icon {
+fn create_storage_icon() -> Icon {
     let size: usize = 22;
     let mut rgba = vec![0u8; size * size * 4];
+
     for y in 0..size {
         for x in 0..size {
             let idx = (y * size + x) * 4;
-            let cx = x as f32 - 10.5;
-            let cy = y as f32 - 10.5;
-            let dist = (cx * cx + cy * cy).sqrt();
-            if dist < 9.0 {
-                rgba[idx] = 60;      // R
-                rgba[idx + 1] = 140; // G
-                rgba[idx + 2] = 220; // B
-                rgba[idx + 3] = 255; // A
+
+            // Draw a simple disk/storage shape:
+            // Rounded rectangle body (4..18 x 5..17)
+            let in_body = x >= 4 && x <= 17 && y >= 5 && y <= 16;
+            // Top rounded edge
+            let in_top = x >= 5 && x <= 16 && y == 4;
+            let in_bottom = x >= 5 && x <= 16 && y == 17;
+            // Activity LED dot (bottom-right)
+            let led_cx = 14.5f32;
+            let led_cy = 14.0f32;
+            let led_dist = ((x as f32 - led_cx).powi(2) + (y as f32 - led_cy).powi(2)).sqrt();
+            let in_led = led_dist < 1.8;
+            // Slot line (top area, like a disk slot)
+            let in_slot = x >= 7 && x <= 14 && y >= 7 && y <= 8;
+
+            if in_led {
+                // Green LED
+                rgba[idx] = 80;
+                rgba[idx + 1] = 220;
+                rgba[idx + 2] = 120;
+                rgba[idx + 3] = 255;
+            } else if in_slot {
+                // Darker slot line
+                rgba[idx] = 120;
+                rgba[idx + 1] = 125;
+                rgba[idx + 2] = 140;
+                rgba[idx + 3] = 255;
+            } else if in_body || in_top || in_bottom {
+                // Body - light gray for visibility on dark & light menu bars
+                rgba[idx] = 180;
+                rgba[idx + 1] = 185;
+                rgba[idx + 2] = 195;
+                rgba[idx + 3] = 255;
             }
         }
     }
@@ -52,13 +78,13 @@ impl Monitor {
         let _ = menu.append(&disk_item);
         let _ = menu.append(&mem_item);
 
-        let icon = create_icon();
+        let icon = create_storage_icon();
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("TidyMac")
             .with_icon(icon)
-            .with_title("-- free")
+            .with_title("--")
             .build()
             .ok()?;
 
@@ -83,8 +109,9 @@ impl Monitor {
                 utils::format_size(info.total),
                 pct,
             ));
-            self._tray
-                .set_title(Some(format!("{} free", utils::format_size(info.available))));
+            // Shorter text for menu bar
+            let free = utils::format_size(info.available);
+            self._tray.set_title(Some(free));
         }
 
         // Memory info
