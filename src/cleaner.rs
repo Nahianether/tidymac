@@ -14,7 +14,7 @@ pub struct ScanResult {
 }
 
 /// The trait every cleaner module implements.
-pub trait Cleaner {
+pub trait Cleaner: Send {
     /// Machine-readable name used in --category flag (e.g. "system-caches").
     fn name(&self) -> &'static str;
 

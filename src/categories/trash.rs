@@ -30,6 +30,11 @@ impl Cleaner for Trash {
                     });
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                errors.push(
+                    "Trash access denied. Grant Full Disk Access: System Settings → Privacy & Security → Full Disk Access → enable your terminal/TidyMac.".to_string()
+                );
+            }
             Err(e) => {
                 errors.push(format!("Cannot read {}: {e}", trash_dir.display()));
             }

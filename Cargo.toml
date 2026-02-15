@@ -1,11 +1,10 @@
 [package]
 name = "tidymac"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A macOS cleanup CLI tool"
+description = "A macOS cleanup GUI tool"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-colored = "3"
+eframe = "0.31"
 walkdir = "2"
 dirs = "6"

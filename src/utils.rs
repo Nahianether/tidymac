@@ -74,6 +74,19 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     Ok((num * multiplier as f64) as u64)
 }
 
+/// Format byte count as human-readable string.
+pub fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.2} KB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 /// Shorten a path for display by replacing home dir with ~.
 pub fn display_path(path: &Path) -> String {
     let home = home_dir();
