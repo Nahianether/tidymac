@@ -620,46 +620,109 @@ impl TidyMacApp {
         let mut should_clean = false;
         let mut should_cancel = false;
 
-        egui::Window::new("Confirm Cleanup")
+        // Dark overlay behind the dialog to block background interaction
+        egui::Area::new(egui::Id::new("confirm_overlay"))
+            .fixed_pos(egui::Pos2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let screen = ui.ctx().screen_rect();
+                ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    0.0,
+                    egui::Color32::from_black_alpha(160),
+                );
+            });
+
+        egui::Window::new("")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([360.0, 0.0])
+            .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("\u{26A0}")
+                            .size(36.0)
+                            .color(egui::Color32::from_rgb(220, 180, 50)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Confirm Deletion")
+                            .size(18.0)
+                            .strong(),
+                    );
+                });
+                ui.add_space(8.0);
+
                 ui.label(format!(
-                    "Delete {} selected items?",
+                    "Are you sure you want to permanently delete {} items?",
                     self.confirm_dialog.file_count
                 ));
                 ui.add_space(8.0);
 
-                for name in &self.confirm_dialog.category_names {
-                    ui.label(format!("  \u{2022} {name}"));
-                }
+                egui::Frame::group(ui.style())
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        for name in &self.confirm_dialog.category_names {
+                            ui.label(format!("\u{2022} {name}"));
+                        }
+                    });
 
                 ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Total: {} will be freed",
+                            utils::format_size(self.confirm_dialog.total_bytes)
+                        ))
+                        .strong()
+                        .size(15.0)
+                        .color(egui::Color32::from_rgb(80, 200, 80)),
+                    );
+                });
+
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!(
-                        "Total: {} will be freed",
-                        utils::format_size(self.confirm_dialog.total_bytes)
-                    ))
-                    .strong(),
+                    egui::RichText::new("This action cannot be undone.")
+                        .small()
+                        .color(egui::Color32::from_rgb(200, 100, 100)),
                 );
                 ui.add_space(12.0);
 
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        should_cancel = true;
-                    }
-                    ui.add_space(20.0);
-                    if ui
-                        .button(
-                            egui::RichText::new("Delete Files")
-                                .color(egui::Color32::from_rgb(220, 60, 60)),
-                        )
-                        .clicked()
-                    {
-                        should_clean = true;
-                    }
+                ui.columns(2, |cols| {
+                    cols[0].vertical_centered(|ui| {
+                        if ui
+                            .add_sized(
+                                [140.0, 32.0],
+                                egui::Button::new("Cancel"),
+                            )
+                            .clicked()
+                        {
+                            should_cancel = true;
+                        }
+                    });
+                    cols[1].vertical_centered(|ui| {
+                        if ui
+                            .add_sized(
+                                [140.0, 32.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Delete Files")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(200, 50, 50)),
+                            )
+                            .clicked()
+                        {
+                            should_clean = true;
+                        }
+                    });
                 });
+                ui.add_space(8.0);
             });
 
         if should_cancel {
