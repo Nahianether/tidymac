@@ -1,6 +1,7 @@
 mod app_logs;
 mod browser_caches;
 mod ds_store;
+mod duplicates;
 mod homebrew;
 mod language_files;
 mod large_files;
@@ -27,6 +28,7 @@ pub fn all_cleaners(min_size_bytes: u64, scan_path: Option<&str>) -> Vec<Box<dyn
         Box::new(trash::Trash),
         Box::new(ds_store::DsStore::new(scan_path)),
         Box::new(language_files::LanguageFiles),
+        Box::new(duplicates::DuplicateFinder),
         Box::new(privacy::PrivacyCleaner),
         Box::new(old_files::OldFiles),
         Box::new(large_files::LargeFiles::new(min_size_bytes, scan_path)),

@@ -36,6 +36,7 @@ fn icon_for_category(name: &str) -> (&'static str, egui::Color32) {
         "homebrew" => ("H", egui::Color32::from_rgb(220, 180, 50)),
         "package-managers" => ("P", egui::Color32::from_rgb(180, 120, 60)),
         "trash" => ("T", egui::Color32::from_rgb(190, 60, 60)),
+        "duplicates" => ("2x", egui::Color32::from_rgb(230, 150, 50)),
         "ds-store" => (".", egui::Color32::from_rgb(140, 140, 160)),
         "language-files" => ("i", egui::Color32::from_rgb(50, 180, 180)),
         "privacy" => ("R", egui::Color32::from_rgb(220, 70, 70)),
