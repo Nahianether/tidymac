@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use eframe::egui;
@@ -12,14 +13,67 @@ pub struct CategoryState {
     pub selected: bool,
     pub expanded: bool,
     pub scan_result: Option<ScanResult>,
+    pub entry_selected: Vec<bool>, // parallel to scan_result.entries
     pub is_report_only: bool,
+}
+
+impl CategoryState {
+    /// Total bytes of only the selected entries.
+    fn selected_bytes(&self) -> u64 {
+        match &self.scan_result {
+            Some(result) => result
+                .entries
+                .iter()
+                .zip(self.entry_selected.iter())
+                .filter(|(_, sel)| **sel)
+                .map(|(e, _)| e.size_bytes)
+                .sum(),
+            None => 0,
+        }
+    }
+
+    /// Number of selected entries.
+    fn selected_count(&self) -> usize {
+        self.entry_selected.iter().filter(|s| **s).count()
+    }
+
+    /// Total entry count.
+    fn entry_count(&self) -> usize {
+        self.scan_result
+            .as_ref()
+            .map(|r| r.entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Set all entries to selected or deselected.
+    fn set_all_entries(&mut self, val: bool) {
+        for s in &mut self.entry_selected {
+            *s = val;
+        }
+    }
+
+    /// Sync the category checkbox from entry selections:
+    /// selected = true if at least one entry is selected.
+    fn sync_category_from_entries(&mut self) {
+        if !self.is_report_only {
+            self.selected = self.entry_selected.iter().any(|s| *s);
+        }
+    }
+}
+
+/// Represents a file to delete — sent to the background thread.
+struct DeleteItem {
+    category_name: String,
+    path: PathBuf,
+    size_bytes: u64,
 }
 
 /// Messages sent from background threads to the UI thread.
 pub enum BgMessage {
     ScanComplete(String, ScanResult),
     AllScansComplete,
-    CleanComplete(String, ScanResult),
+    DeletedFile(String, PathBuf, u64),
+    DeleteError(String, PathBuf, String),
     AllCleansComplete,
     Progress(String),
 }
@@ -35,8 +89,9 @@ pub enum AppPhase {
 /// Confirmation dialog state.
 pub struct ConfirmDialog {
     pub visible: bool,
-    pub categories_to_clean: Vec<String>,
     pub total_bytes: u64,
+    pub file_count: usize,
+    pub category_names: Vec<String>,
 }
 
 pub struct TidyMacApp {
@@ -46,6 +101,7 @@ pub struct TidyMacApp {
     progress_label: String,
     confirm_dialog: ConfirmDialog,
     errors: Vec<String>,
+    cleaned_bytes: u64,
 }
 
 impl TidyMacApp {
@@ -59,6 +115,7 @@ impl TidyMacApp {
                 selected: c.name() != "large-files",
                 expanded: false,
                 scan_result: None,
+                entry_selected: vec![],
                 is_report_only: c.name() == "large-files",
             })
             .collect();
@@ -70,10 +127,12 @@ impl TidyMacApp {
             progress_label: String::new(),
             confirm_dialog: ConfirmDialog {
                 visible: false,
-                categories_to_clean: vec![],
                 total_bytes: 0,
+                file_count: 0,
+                category_names: vec![],
             },
             errors: vec![],
+            cleaned_bytes: 0,
         }
     }
 
@@ -81,9 +140,11 @@ impl TidyMacApp {
         self.phase = AppPhase::Scanning;
         self.progress_label = "Starting scan...".to_string();
         self.errors.clear();
+        self.cleaned_bytes = 0;
 
         for cat in &mut self.categories {
             cat.scan_result = None;
+            cat.entry_selected.clear();
         }
 
         let (tx, rx) = mpsc::channel::<BgMessage>();
@@ -107,28 +168,50 @@ impl TidyMacApp {
         self.phase = AppPhase::Cleaning;
         self.progress_label = "Starting cleanup...".to_string();
         self.confirm_dialog.visible = false;
+        self.cleaned_bytes = 0;
 
-        let selected_names: Vec<String> = self
-            .categories
-            .iter()
-            .filter(|c| c.selected && !c.is_report_only)
-            .map(|c| c.name.to_string())
-            .collect();
+        // Collect specific files to delete from selected entries
+        let mut items: Vec<DeleteItem> = Vec::new();
+        for cat in &self.categories {
+            if !cat.selected || cat.is_report_only {
+                continue;
+            }
+            if let Some(ref result) = cat.scan_result {
+                for (entry, sel) in result.entries.iter().zip(cat.entry_selected.iter()) {
+                    if *sel {
+                        items.push(DeleteItem {
+                            category_name: cat.name.to_string(),
+                            path: entry.path.clone(),
+                            size_bytes: entry.size_bytes,
+                        });
+                    }
+                }
+            }
+        }
 
         let (tx, rx) = mpsc::channel::<BgMessage>();
         self.receiver = Some(rx);
 
         std::thread::spawn(move || {
-            for name in &selected_names {
-                if let Some(cleaner) =
-                    crate::categories::find_cleaner(name, 104_857_600, None)
-                {
-                    let _ = tx.send(BgMessage::Progress(cleaner.label().to_string()));
-                    let result = cleaner.clean(false);
-                    let _ = tx.send(BgMessage::CleanComplete(
-                        cleaner.name().to_string(),
-                        result,
-                    ));
+            for item in &items {
+                let _ = tx.send(BgMessage::Progress(
+                    format!("Deleting: {}", item.path.display()),
+                ));
+                match utils::safe_remove(&item.path) {
+                    Ok(freed) => {
+                        let _ = tx.send(BgMessage::DeletedFile(
+                            item.category_name.clone(),
+                            item.path.clone(),
+                            freed,
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BgMessage::DeleteError(
+                            item.category_name.clone(),
+                            item.path.clone(),
+                            e.to_string(),
+                        ));
+                    }
                 }
             }
             let _ = tx.send(BgMessage::AllCleansComplete);
@@ -140,28 +223,44 @@ impl TidyMacApp {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     BgMessage::Progress(label) => {
-                        self.progress_label = format!("Processing: {}...", label);
+                        self.progress_label = label;
                     }
                     BgMessage::ScanComplete(name, result) => {
                         if let Some(cat) =
                             self.categories.iter_mut().find(|c| c.name == name)
                         {
+                            let count = result.entries.len();
                             cat.scan_result = Some(result);
+                            cat.entry_selected = vec![true; count];
                         }
                     }
                     BgMessage::AllScansComplete => {
                         self.phase = AppPhase::Idle;
                         self.progress_label.clear();
                     }
-                    BgMessage::CleanComplete(name, result) => {
-                        for err in &result.errors {
-                            self.errors.push(err.clone());
-                        }
+                    BgMessage::DeletedFile(cat_name, path, freed) => {
+                        self.cleaned_bytes += freed;
+                        // Remove the deleted entry from the category
                         if let Some(cat) =
-                            self.categories.iter_mut().find(|c| c.name == name)
+                            self.categories.iter_mut().find(|c| c.name == cat_name)
                         {
-                            cat.scan_result = Some(result);
+                            if let Some(ref mut result) = cat.scan_result {
+                                if let Some(idx) =
+                                    result.entries.iter().position(|e| e.path == path)
+                                {
+                                    result.entries.remove(idx);
+                                    cat.entry_selected.remove(idx);
+                                    result.total_bytes =
+                                        result.entries.iter().map(|e| e.size_bytes).sum();
+                                }
+                            }
                         }
+                    }
+                    BgMessage::DeleteError(_cat_name, path, err) => {
+                        self.errors.push(format!(
+                            "Failed to delete {}: {err}",
+                            path.display()
+                        ));
                     }
                     BgMessage::AllCleansComplete => {
                         self.phase = AppPhase::Idle;
@@ -173,25 +272,32 @@ impl TidyMacApp {
     }
 
     fn show_confirm_dialog(&mut self) {
-        let selected: Vec<String> = self
-            .categories
-            .iter()
-            .filter(|c| c.selected && !c.is_report_only && c.scan_result.is_some())
-            .map(|c| c.name.to_string())
-            .collect();
+        let mut total_bytes = 0u64;
+        let mut file_count = 0usize;
+        let mut category_names = Vec::new();
 
-        let total: u64 = self
-            .categories
-            .iter()
-            .filter(|c| c.selected && !c.is_report_only)
-            .filter_map(|c| c.scan_result.as_ref())
-            .map(|r| r.total_bytes)
-            .sum();
+        for cat in &self.categories {
+            if !cat.selected || cat.is_report_only {
+                continue;
+            }
+            let sel_count = cat.selected_count();
+            if sel_count > 0 {
+                total_bytes += cat.selected_bytes();
+                file_count += sel_count;
+                category_names.push(format!(
+                    "{} ({} items, {})",
+                    cat.label,
+                    sel_count,
+                    utils::format_size(cat.selected_bytes())
+                ));
+            }
+        }
 
         self.confirm_dialog = ConfirmDialog {
             visible: true,
-            categories_to_clean: selected,
-            total_bytes: total,
+            total_bytes,
+            file_count,
+            category_names,
         };
     }
 
@@ -241,16 +347,17 @@ impl TidyMacApp {
                 for cat in &mut self.categories {
                     if !cat.is_report_only {
                         cat.selected = new_val;
+                        cat.set_all_entries(new_val);
                     }
                 }
             }
 
             let has_scanned = self.categories.iter().any(|c| c.scan_result.is_some());
-            let has_selected = self
+            let has_any_selected = self
                 .categories
                 .iter()
-                .any(|c| c.selected && !c.is_report_only);
-            let can_clean = !is_busy && has_scanned && has_selected;
+                .any(|c| c.selected && !c.is_report_only && c.selected_count() > 0);
+            let can_clean = !is_busy && has_scanned && has_any_selected;
 
             if ui
                 .add_enabled(
@@ -275,6 +382,21 @@ impl TidyMacApp {
                 ui.label(&self.progress_label);
             }
         });
+
+        // Show cleaned bytes after a clean operation
+        if self.cleaned_bytes > 0 && self.phase == AppPhase::Idle {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Last cleanup freed: {}",
+                        utils::format_size(self.cleaned_bytes)
+                    ))
+                    .color(egui::Color32::from_rgb(80, 200, 80)),
+                );
+            });
+        }
+
         ui.add_space(4.0);
     }
 
@@ -293,21 +415,38 @@ impl TidyMacApp {
     }
 
     fn render_category_row(ui: &mut egui::Ui, cat: &mut CategoryState) {
-        let size_text = match &cat.scan_result {
-            Some(result) => utils::format_size(result.total_bytes),
-            None => "---".to_string(),
-        };
+        let selected_size = cat.selected_bytes();
+        let total_size = cat
+            .scan_result
+            .as_ref()
+            .map(|r| r.total_bytes)
+            .unwrap_or(0);
 
-        let id = ui.make_persistent_id(cat.name);
+        let size_text = if cat.scan_result.is_none() {
+            "---".to_string()
+        } else if selected_size == total_size {
+            utils::format_size(total_size)
+        } else {
+            format!(
+                "{} / {}",
+                utils::format_size(selected_size),
+                utils::format_size(total_size)
+            )
+        };
 
         // Header row with checkbox, label, and size
         ui.horizontal(|ui| {
-            // Checkbox
+            // Category checkbox
             if cat.is_report_only {
                 let mut dummy = false;
                 ui.add_enabled(false, egui::Checkbox::new(&mut dummy, ""));
             } else {
+                let before = cat.selected;
                 ui.checkbox(&mut cat.selected, "");
+                // If category checkbox was toggled, update all entry selections
+                if cat.selected != before {
+                    cat.set_all_entries(cat.selected);
+                }
             }
 
             // Clickable label to toggle expand
@@ -317,12 +456,22 @@ impl TidyMacApp {
                 cat.label.to_string()
             };
 
+            let sel_info = if cat.entry_count() > 0 && !cat.is_report_only {
+                format!(" ({}/{})", cat.selected_count(), cat.entry_count())
+            } else {
+                String::new()
+            };
+
             let arrow = if cat.expanded { "\u{25BC}" } else { "\u{25B6}" };
 
             if ui
                 .selectable_label(
                     false,
-                    egui::RichText::new(format!("{} {}", arrow, label_text)).strong(),
+                    egui::RichText::new(format!(
+                        "{} {}{}",
+                        arrow, label_text, sel_info
+                    ))
+                    .strong(),
                 )
                 .clicked()
             {
@@ -340,85 +489,109 @@ impl TidyMacApp {
             });
         });
 
-        // Expanded entries
-        if cat.expanded {
-            let mut state =
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    id,
-                    true,
-                );
-            state.set_open(true);
-            state.show_body_unindented(ui, |ui| {
-                ui.indent(id, |ui| {
-                    if let Some(ref result) = cat.scan_result {
-                        if result.entries.is_empty() {
-                            ui.label(
-                                egui::RichText::new("Nothing found.")
-                                    .italics()
-                                    .color(egui::Color32::GRAY),
-                            );
-                        } else {
-                            for entry in &result.entries {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(utils::display_path(
-                                            &entry.path,
-                                        ))
-                                        .color(egui::Color32::from_rgb(
-                                            160, 160, 170,
-                                        )),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(
-                                            egui::Align::Center,
-                                        ),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    utils::format_size(
-                                                        entry.size_bytes,
-                                                    ),
-                                                )
-                                                .color(egui::Color32::from_rgb(
-                                                    220, 180, 50,
-                                                )),
-                                            );
-                                        },
-                                    );
-                                });
-                            }
-                        }
-                        for err in &result.errors {
-                            if err.contains("Full Disk Access") {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Requires Full Disk Access.")
-                                            .color(egui::Color32::from_rgb(220, 150, 50)),
-                                    );
-                                    if ui.button("Open System Settings").clicked() {
-                                        let _ = std::process::Command::new("open")
-                                            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
-                                            .spawn();
-                                    }
-                                });
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(format!("Warning: {err}"))
-                                        .color(egui::Color32::from_rgb(220, 100, 50)),
-                                );
-                            }
-                        }
-                    } else {
-                        ui.label(
-                            egui::RichText::new("Not yet scanned. Click \"Scan All\" to start.")
-                                .italics()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                });
-            });
+        // Expanded entries with per-entry checkboxes
+        if !cat.expanded {
+            return;
         }
+
+        let entry_count = cat.entry_count();
+        let has_result = cat.scan_result.is_some();
+
+        ui.indent(cat.name, |ui| {
+            if !has_result {
+                ui.label(
+                    egui::RichText::new(
+                        "Not yet scanned. Click \"Scan All\" to start.",
+                    )
+                    .italics()
+                    .color(egui::Color32::GRAY),
+                );
+                return;
+            }
+
+            if entry_count == 0 {
+                ui.label(
+                    egui::RichText::new("Nothing found.")
+                        .italics()
+                        .color(egui::Color32::GRAY),
+                );
+            } else {
+                // Select All / None buttons for this category
+                if !cat.is_report_only {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Select All").clicked() {
+                            cat.set_all_entries(true);
+                            cat.selected = true;
+                        }
+                        if ui.small_button("Select None").clicked() {
+                            cat.set_all_entries(false);
+                            cat.selected = false;
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+
+                // Render each entry — extract display data first to avoid borrow conflicts
+                for idx in 0..entry_count {
+                    let (path_display, size_bytes) = {
+                        let entry = &cat.scan_result.as_ref().unwrap().entries[idx];
+                        (utils::display_path(&entry.path), entry.size_bytes)
+                    };
+
+                    ui.horizontal(|ui| {
+                        if !cat.is_report_only && idx < cat.entry_selected.len() {
+                            let before = cat.entry_selected[idx];
+                            ui.checkbox(&mut cat.entry_selected[idx], "");
+                            if cat.entry_selected[idx] != before {
+                                cat.sync_category_from_entries();
+                            }
+                        }
+
+                        ui.label(
+                            egui::RichText::new(&path_display)
+                                .color(egui::Color32::from_rgb(160, 160, 170)),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(utils::format_size(size_bytes))
+                                        .color(egui::Color32::from_rgb(220, 180, 50)),
+                                );
+                            },
+                        );
+                    });
+                }
+            }
+
+            // Render errors — extract to avoid borrow conflict
+            let errors: Vec<String> = cat
+                .scan_result
+                .as_ref()
+                .map(|r| r.errors.clone())
+                .unwrap_or_default();
+
+            for err in &errors {
+                if err.contains("Full Disk Access") {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Requires Full Disk Access.")
+                                .color(egui::Color32::from_rgb(220, 150, 50)),
+                        );
+                        if ui.button("Open System Settings").clicked() {
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                                .spawn();
+                        }
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("Warning: {err}"))
+                            .color(egui::Color32::from_rgb(220, 100, 50)),
+                    );
+                }
+            }
+        });
     }
 
     fn render_summary(&self, ui: &mut egui::Ui) {
@@ -426,8 +599,7 @@ impl TidyMacApp {
             .categories
             .iter()
             .filter(|c| c.selected && !c.is_report_only)
-            .filter_map(|c| c.scan_result.as_ref())
-            .map(|r| r.total_bytes)
+            .map(|c| c.selected_bytes())
             .sum();
 
         ui.add_space(4.0);
@@ -453,10 +625,13 @@ impl TidyMacApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("Are you sure you want to delete files in these categories?");
+                ui.label(format!(
+                    "Delete {} selected items?",
+                    self.confirm_dialog.file_count
+                ));
                 ui.add_space(8.0);
 
-                for name in &self.confirm_dialog.categories_to_clean {
+                for name in &self.confirm_dialog.category_names {
                     ui.label(format!("  \u{2022} {name}"));
                 }
 
