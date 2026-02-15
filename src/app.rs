@@ -37,6 +37,8 @@ fn icon_for_category(name: &str) -> (&'static str, egui::Color32) {
         "package-managers" => ("P", egui::Color32::from_rgb(180, 120, 60)),
         "trash" => ("T", egui::Color32::from_rgb(190, 60, 60)),
         "ds-store" => (".", egui::Color32::from_rgb(140, 140, 160)),
+        "language-files" => ("i", egui::Color32::from_rgb(50, 180, 180)),
+        "old-files" => ("O", egui::Color32::from_rgb(200, 160, 50)),
         "large-files" => ("F", egui::Color32::from_rgb(200, 80, 200)),
         _ => ("?", egui::Color32::from_rgb(140, 140, 160)),
     }
@@ -223,11 +225,11 @@ impl TidyMacApp {
                 label: c.label(),
                 icon,
                 icon_color,
-                selected: c.name() != "large-files",
+                selected: c.name() != "large-files" && c.name() != "old-files",
                 expanded: false,
                 scan_result: None,
                 entry_selected: vec![],
-                is_report_only: c.name() == "large-files",
+                is_report_only: c.name() == "large-files" || c.name() == "old-files",
             }})
             .collect();
 
