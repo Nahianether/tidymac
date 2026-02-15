@@ -8,10 +8,32 @@ use walkdir::WalkDir;
 /// Minimum file size: 1 MB
 const MIN_SIZE: u64 = 1_048_576;
 
+/// Maximum file size for hashing: 500 MB (skip very large files)
+const MAX_SIZE: u64 = 500_000_000;
+
 /// Bytes to read for partial hash (first 4 KB)
 const PARTIAL_READ: usize = 4096;
 
+/// Directories/bundles to skip inside scanned folders
+const SKIP_EXTENSIONS: &[&str] = &[
+    ".photoslibrary",
+    ".musiclibrary",
+    ".tvlibrary",
+    ".fcpbundle",
+    ".vmwarevm",
+    ".parallels",
+    ".app",
+];
+
 pub struct DuplicateFinder;
+
+fn should_skip_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SKIP_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+        || lower == ".trash"
+        || lower == "node_modules"
+        || lower == ".git"
+}
 
 /// Compute blake3 hash of the first `n` bytes of a file.
 fn partial_hash(path: &std::path::Path) -> Option<blake3::Hash> {
@@ -69,6 +91,13 @@ impl Cleaner for DuplicateFinder {
             for entry in WalkDir::new(dir)
                 .follow_links(false)
                 .into_iter()
+                .filter_entry(|e| {
+                    if e.file_type().is_dir() {
+                        let name = e.file_name().to_string_lossy();
+                        return !should_skip_dir(&name);
+                    }
+                    true
+                })
                 .filter_map(|e| e.ok())
             {
                 let path = entry.path();
@@ -79,7 +108,7 @@ impl Cleaner for DuplicateFinder {
                     Ok(m) => m.len(),
                     Err(_) => continue,
                 };
-                if size < MIN_SIZE {
+                if size < MIN_SIZE || size > MAX_SIZE {
                     continue;
                 }
                 size_groups
