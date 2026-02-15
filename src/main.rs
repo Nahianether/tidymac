@@ -3,6 +3,7 @@ mod categories;
 mod cleaner;
 mod disk_info;
 mod monitor;
+mod shredder;
 mod utils;
 
 use eframe::egui;

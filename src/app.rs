@@ -123,6 +123,7 @@ pub enum BgMessage {
     DeletedFile(String, PathBuf, u64),
     DeleteError(String, PathBuf, String),
     AllCleansComplete,
+    AllShredsComplete,
     Progress(String),
 }
 
@@ -135,6 +136,7 @@ pub enum AppPhase {
 
 pub struct ConfirmDialog {
     pub visible: bool,
+    pub shred_mode: bool,
     pub total_bytes: u64,
     pub file_count: usize,
     pub category_names: Vec<String>,
@@ -244,6 +246,7 @@ impl TidyMacApp {
             progress_label: String::new(),
             confirm_dialog: ConfirmDialog {
                 visible: false,
+                shred_mode: false,
                 total_bytes: 0,
                 file_count: 0,
                 category_names: vec![],
@@ -373,7 +376,7 @@ impl TidyMacApp {
                         self.errors
                             .push(format!("Failed to delete {}: {err}", path.display()));
                     }
-                    BgMessage::AllCleansComplete => {
+                    BgMessage::AllCleansComplete | BgMessage::AllShredsComplete => {
                         self.phase = AppPhase::Idle;
                         self.progress_label.clear();
                         self.disk_info = disk_info::get_disk_info();
@@ -386,7 +389,7 @@ impl TidyMacApp {
         }
     }
 
-    fn show_confirm_dialog(&mut self) {
+    fn show_confirm_dialog(&mut self, shred_mode: bool) {
         let mut total_bytes = 0u64;
         let mut file_count = 0usize;
         let mut category_names = Vec::new();
@@ -411,10 +414,65 @@ impl TidyMacApp {
 
         self.confirm_dialog = ConfirmDialog {
             visible: true,
+            shred_mode,
             total_bytes,
             file_count,
             category_names,
         };
+    }
+
+    fn start_shred(&mut self) {
+        self.phase = AppPhase::Cleaning;
+        self.progress_label = "Starting secure shred...".to_string();
+        self.confirm_dialog.visible = false;
+        self.cleaned_bytes = 0;
+
+        let mut items: Vec<DeleteItem> = Vec::new();
+        for cat in &self.categories {
+            if !cat.selected || cat.is_report_only {
+                continue;
+            }
+            if let Some(ref result) = cat.scan_result {
+                for (entry, sel) in result.entries.iter().zip(cat.entry_selected.iter()) {
+                    if *sel {
+                        items.push(DeleteItem {
+                            category_name: cat.name.to_string(),
+                            path: entry.path.clone(),
+                            size_bytes: entry.size_bytes,
+                        });
+                    }
+                }
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<BgMessage>();
+        self.receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            for item in &items {
+                let tx_ref = &tx;
+                let mut progress_fn = |msg: &str| {
+                    let _ = tx_ref.send(BgMessage::Progress(msg.to_string()));
+                };
+                match crate::shredder::shred_file(&item.path, &mut progress_fn) {
+                    Ok(freed) => {
+                        let _ = tx.send(BgMessage::DeletedFile(
+                            item.category_name.clone(),
+                            item.path.clone(),
+                            freed,
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BgMessage::DeleteError(
+                            item.category_name.clone(),
+                            item.path.clone(),
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
+            let _ = tx.send(BgMessage::AllShredsComplete);
+        });
     }
 
     // ── Rendering ──────────────────────────────────────────────────────
@@ -625,9 +683,42 @@ impl TidyMacApp {
             .min_size(egui::vec2(170.0, 36.0));
 
             if ui.add_enabled(can_clean, clean_btn).clicked() {
-                self.show_confirm_dialog();
+                self.show_confirm_dialog(false);
             }
         });
+
+        // Secure Delete button (below action bar)
+        let has_scanned = self.categories.iter().any(|c| c.scan_result.is_some());
+        let has_any_selected = self
+            .categories
+            .iter()
+            .any(|c| c.selected && !c.is_report_only && c.selected_count() > 0);
+        let can_shred = !is_busy && has_scanned && has_any_selected;
+
+        if has_scanned {
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let shred_btn = egui::Button::new(
+                    egui::RichText::new("Secure Delete")
+                        .size(12.0)
+                        .color(if can_shred {
+                            YELLOW
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        }),
+                )
+                .corner_radius(egui::CornerRadius::same(6))
+                .min_size(egui::vec2(120.0, 28.0));
+
+                if ui
+                    .add_enabled(can_shred, shred_btn)
+                    .on_hover_text("Overwrite files with random data before deleting (3-pass)")
+                    .clicked()
+                {
+                    self.show_confirm_dialog(true);
+                }
+            });
+        }
 
         // Progress bar
         if is_busy {
@@ -1043,25 +1134,36 @@ impl TidyMacApp {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.add_space(12.0);
+                let is_shred = self.confirm_dialog.shred_mode;
+                let title = if is_shred { "Confirm Secure Shred" } else { "Confirm Deletion" };
+                let desc = if is_shred {
+                    format!(
+                        "Securely shred {} items? Files will be overwritten\nwith 3 passes (random/zeros/random) before deletion.",
+                        self.confirm_dialog.file_count
+                    )
+                } else {
+                    format!(
+                        "Are you sure you want to permanently delete {} items?",
+                        self.confirm_dialog.file_count
+                    )
+                };
+
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("[!]").size(40.0));
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("Confirm Deletion")
+                        egui::RichText::new(title)
                             .size(20.0)
                             .strong()
-                            .color(TEXT_PRIMARY),
+                            .color(if is_shred { YELLOW } else { TEXT_PRIMARY }),
                     );
                 });
                 ui.add_space(10.0);
 
                 ui.label(
-                    egui::RichText::new(format!(
-                        "Are you sure you want to permanently delete {} items?",
-                        self.confirm_dialog.file_count
-                    ))
-                    .size(13.0)
-                    .color(egui::Color32::from_rgb(200, 200, 210)),
+                    egui::RichText::new(desc)
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(200, 200, 210)),
                 );
                 ui.add_space(8.0);
 
@@ -1094,13 +1196,25 @@ impl TidyMacApp {
 
                 ui.add_space(4.0);
                 ui.vertical_centered(|ui| {
+                    let warn_text = if is_shred {
+                        "Data will be unrecoverable after shredding."
+                    } else {
+                        "This action cannot be undone."
+                    };
                     ui.label(
-                        egui::RichText::new("This action cannot be undone.")
+                        egui::RichText::new(warn_text)
                             .size(11.0)
                             .color(egui::Color32::from_rgb(200, 100, 100)),
                     );
                 });
                 ui.add_space(14.0);
+
+                let action_label = if is_shred { "Shred Files" } else { "Delete Files" };
+                let action_color = if is_shred {
+                    egui::Color32::from_rgb(180, 130, 30)
+                } else {
+                    RED
+                };
 
                 ui.columns(2, |cols| {
                     cols[0].vertical_centered(|ui| {
@@ -1117,12 +1231,12 @@ impl TidyMacApp {
                     });
                     cols[1].vertical_centered(|ui| {
                         let btn = egui::Button::new(
-                            egui::RichText::new("Delete Files")
+                            egui::RichText::new(action_label)
                                 .size(14.0)
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         )
-                        .fill(RED)
+                        .fill(action_color)
                         .corner_radius(egui::CornerRadius::same(8))
                         .min_size(egui::vec2(150.0, 36.0));
                         if ui.add(btn).clicked() {
@@ -1137,7 +1251,11 @@ impl TidyMacApp {
             self.confirm_dialog.visible = false;
         }
         if should_clean {
-            self.start_clean();
+            if self.confirm_dialog.shred_mode {
+                self.start_shred();
+            } else {
+                self.start_clean();
+            }
         }
     }
 
