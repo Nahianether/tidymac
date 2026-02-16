@@ -14,15 +14,33 @@ use crate::utils;
 const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(28, 28, 38);
 const CARD_FILL: egui::Color32 = egui::Color32::from_rgb(30, 30, 42);
 const CARD_EXPANDED: egui::Color32 = egui::Color32::from_rgb(35, 35, 48);
+const CARD_HOVER: egui::Color32 = egui::Color32::from_rgb(38, 38, 54);
 const INSET_FILL: egui::Color32 = egui::Color32::from_rgb(25, 25, 35);
 const BORDER: egui::Color32 = egui::Color32::from_rgb(50, 50, 65);
+const BORDER_HOVER: egui::Color32 = egui::Color32::from_rgb(70, 70, 90);
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(60, 140, 220);
+const ACCENT_BRIGHT: egui::Color32 = egui::Color32::from_rgb(80, 170, 255);
 const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(225, 225, 235);
 const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(140, 140, 160);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(80, 220, 120);
 const RED: egui::Color32 = egui::Color32::from_rgb(190, 45, 45);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(220, 180, 50);
 const TITLE_BLUE: egui::Color32 = egui::Color32::from_rgb(80, 180, 220);
+
+// ── Animation helpers ─────────────────────────────────────────────────
+
+fn lerp_f32(current: f32, target: f32, speed: f32) -> f32 {
+    current + (target - current) * speed.clamp(0.0, 1.0)
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    egui::Color32::from_rgb(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t) as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t) as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t) as u8,
+    )
+}
 
 // ── Icon mapping ───────────────────────────────────────────────────────
 
@@ -181,6 +199,13 @@ pub struct TidyMacApp {
     clean_report: Vec<String>,
     dropped_files: Vec<PathBuf>,
     drop_confirm_visible: bool,
+    // Animation state
+    anim_disk_pct: f32,
+    anim_mem_pct: f32,
+    anim_progress: f32,
+    anim_summary_size: f64,
+    category_hover: Vec<f32>,
+    view_alpha: f32,
 }
 
 // ── App impl ───────────────────────────────────────────────────────────
@@ -193,7 +218,6 @@ impl TidyMacApp {
 
         let bg_dark = egui::Color32::from_rgb(20, 20, 28);
         let bg_widget = egui::Color32::from_rgb(40, 40, 55);
-        let bg_widget_hover = egui::Color32::from_rgb(50, 50, 68);
         let bg_widget_active = egui::Color32::from_rgb(60, 60, 80);
 
         visuals.panel_fill = BG_PANEL;
@@ -207,17 +231,19 @@ impl TidyMacApp {
         visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_SECONDARY);
         visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
 
-        visuals.widgets.hovered.bg_fill = bg_widget_hover;
-        visuals.widgets.hovered.weak_bg_fill = bg_widget_hover;
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(52, 52, 72);
+        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(52, 52, 72);
         visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
         visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.hovered.expansion = 1.0;
 
-        visuals.widgets.active.bg_fill = bg_widget_active;
-        visuals.widgets.active.weak_bg_fill = bg_widget_active;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, ACCENT);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, TEXT_PRIMARY);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(62, 62, 85);
+        visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(62, 62, 85);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.5, ACCENT_BRIGHT);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
         visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        visuals.widgets.active.expansion = 0.5;
 
         visuals.widgets.open.bg_fill = bg_widget_active;
         visuals.widgets.open.weak_bg_fill = bg_widget_active;
@@ -242,8 +268,9 @@ impl TidyMacApp {
         style.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
 
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.button_padding = egui::vec2(14.0, 7.0);
         style.spacing.window_margin = egui::Margin::same(16);
+        style.spacing.interact_size = egui::vec2(40.0, 22.0);
 
         style.visuals = visuals;
         cc.egui_ctx.set_style(style);
@@ -267,6 +294,7 @@ impl TidyMacApp {
             }})
             .collect();
 
+        let cat_count = categories.len();
         Self {
             categories,
             phase: AppPhase::Idle,
@@ -299,6 +327,13 @@ impl TidyMacApp {
             clean_report: vec![],
             dropped_files: vec![],
             drop_confirm_visible: false,
+            // Animations
+            anim_disk_pct: 0.0,
+            anim_mem_pct: 0.0,
+            anim_progress: 0.0,
+            anim_summary_size: 0.0,
+            category_hover: vec![0.0; cat_count],
+            view_alpha: 1.0,
         }
     }
 
@@ -616,6 +651,7 @@ impl TidyMacApp {
             .min_size(egui::vec2(100.0, 24.0));
             if ui.add(analyzer_btn).on_hover_text("Analyze application sizes").clicked() {
                 self.view_mode = ViewMode::Analyzer;
+                self.view_alpha = 0.0; // trigger fade-in
             }
 
             ui.add_space(4.0);
@@ -671,10 +707,19 @@ impl TidyMacApp {
         ui.add_space(12.0);
     }
 
-    fn render_disk_bar(&self, ui: &mut egui::Ui) {
+    fn render_disk_bar(&mut self, ui: &mut egui::Ui) {
         let Some(ref info) = self.disk_info else {
             return;
         };
+
+        let target_pct = info.usage_percent();
+        self.anim_disk_pct = lerp_f32(self.anim_disk_pct, target_pct, 0.08);
+        let pct = self.anim_disk_pct;
+
+        // Keep animating until close to target
+        if (pct - target_pct).abs() > 0.001 {
+            ui.ctx().request_repaint();
+        }
 
         egui::Frame::NONE
             .fill(CARD_FILL)
@@ -707,7 +752,7 @@ impl TidyMacApp {
 
                 ui.add_space(6.0);
 
-                // Bar
+                // Gradient bar
                 let bar_height = 14.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_height),
@@ -715,17 +760,60 @@ impl TidyMacApp {
                 );
                 let painter = ui.painter();
 
-                // Background (free space)
+                // Background
                 painter.rect_filled(bar_rect, 7.0, egui::Color32::from_rgb(40, 40, 55));
 
-                // Used portion
-                let pct = info.usage_percent();
+                // Used portion with gradient
                 let used_width = bar_rect.width() * pct;
-                let used_rect = egui::Rect::from_min_size(
-                    bar_rect.min,
-                    egui::vec2(used_width, bar_height),
-                );
+                if used_width > 1.0 {
+                    let bar_color_start = if pct < 0.6 {
+                        GREEN
+                    } else if pct < 0.8 {
+                        egui::Color32::from_rgb(180, 200, 50)
+                    } else {
+                        egui::Color32::from_rgb(220, 120, 40)
+                    };
+                    let bar_color_end = if pct < 0.6 {
+                        egui::Color32::from_rgb(50, 180, 100)
+                    } else if pct < 0.8 {
+                        YELLOW
+                    } else {
+                        egui::Color32::from_rgb(220, 60, 60)
+                    };
 
+                    // Draw gradient with horizontal slices
+                    let steps = 20;
+                    let slice_w = used_width / steps as f32;
+                    for s in 0..steps {
+                        let t = s as f32 / steps as f32;
+                        let color = lerp_color(bar_color_start, bar_color_end, t);
+                        let x = bar_rect.min.x + s as f32 * slice_w;
+                        let slice = egui::Rect::from_min_size(
+                            egui::pos2(x, bar_rect.min.y),
+                            egui::vec2(slice_w + 1.0, bar_height),
+                        );
+                        painter.rect_filled(slice, 0.0, color);
+                    }
+
+                    // Round the ends by re-drawing the full used rect clipped with rounding
+                    let used_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(used_width, bar_height),
+                    );
+                    // Overlay subtle highlight on top half for 3D effect
+                    let highlight_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(used_width, bar_height * 0.45),
+                    );
+                    painter.rect_filled(highlight_rect, 7.0, egui::Color32::from_white_alpha(18));
+
+                    // Clip corners by redrawing background on the outside
+                    painter.rect_stroke(used_rect, 7.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(40, 40, 55)), egui::epaint::StrokeKind::Outside);
+                }
+
+                ui.add_space(4.0);
+
+                // Used / Total text
                 let bar_color = if pct < 0.6 {
                     GREEN
                 } else if pct < 0.8 {
@@ -733,11 +821,6 @@ impl TidyMacApp {
                 } else {
                     egui::Color32::from_rgb(220, 60, 60)
                 };
-                painter.rect_filled(used_rect, 7.0, bar_color);
-
-                ui.add_space(4.0);
-
-                // Used / Total text
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!(
@@ -903,23 +986,101 @@ impl TidyMacApp {
             }
         });
 
-        // Progress bar
+        // Custom gradient progress bar
         if is_busy {
             ui.add_space(8.0);
+
+            let target_frac = if self.progress_total > 0 {
+                self.progress_completed as f32 / self.progress_total as f32
+            } else {
+                0.0
+            };
+            self.anim_progress = lerp_f32(self.anim_progress, target_frac, 0.10);
+            let frac = self.anim_progress;
+
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let frac = if self.progress_total > 0 {
-                    self.progress_completed as f32 / self.progress_total as f32
-                } else {
-                    0.0
-                };
-                let bar = egui::ProgressBar::new(frac)
-                    .desired_width(ui.available_width() - 16.0);
-                ui.add(bar);
+                let bar_height = 16.0;
+                let bar_width = ui.available_width() - 16.0;
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(bar_width, bar_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+
+                // Background pill
+                painter.rect_filled(bar_rect, 8.0, egui::Color32::from_rgb(35, 35, 50));
+
+                // Filled portion with gradient
+                let filled_w = bar_rect.width() * frac;
+                if filled_w > 2.0 {
+                    let gradient_start = ACCENT;
+                    let gradient_end = egui::Color32::from_rgb(60, 200, 160);
+                    let steps = 24;
+                    let slice_w = filled_w / steps as f32;
+                    for s in 0..steps {
+                        let t = s as f32 / steps as f32;
+                        let color = lerp_color(gradient_start, gradient_end, t);
+                        let x = bar_rect.min.x + s as f32 * slice_w;
+                        let slice = egui::Rect::from_min_size(
+                            egui::pos2(x, bar_rect.min.y),
+                            egui::vec2(slice_w + 1.0, bar_height),
+                        );
+                        painter.rect_filled(slice, 0.0, color);
+                    }
+
+                    // Highlight on top half for 3D depth
+                    let highlight_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(filled_w, bar_height * 0.4),
+                    );
+                    painter.rect_filled(highlight_rect, 8.0, egui::Color32::from_white_alpha(20));
+
+                    // Shimmer effect — a bright moving band
+                    let time = ui.input(|i| i.time) as f32;
+                    let shimmer_x = bar_rect.min.x + ((time * 0.6).fract()) * filled_w;
+                    let shimmer_w = 30.0_f32.min(filled_w * 0.2);
+                    if shimmer_x + shimmer_w <= bar_rect.min.x + filled_w {
+                        let shimmer_rect = egui::Rect::from_min_size(
+                            egui::pos2(shimmer_x, bar_rect.min.y),
+                            egui::vec2(shimmer_w, bar_height),
+                        );
+                        painter.rect_filled(shimmer_rect, 0.0, egui::Color32::from_white_alpha(25));
+                    }
+
+                    // Clean pill outline
+                    let filled_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(filled_w, bar_height),
+                    );
+                    painter.rect_stroke(filled_rect, 8.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 35, 50)), egui::epaint::StrokeKind::Outside);
+                }
+
+                // Percentage text centered in bar
+                if frac > 0.15 {
+                    let filled_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(filled_w, bar_height),
+                    );
+                    painter.text(
+                        filled_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{:.0}%", frac * 100.0),
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::WHITE,
+                    );
+                }
             });
+
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
+
+                // Pulsing dots animation
+                let time = ui.input(|i| i.time);
+                let dot_count = (time * 3.0) as usize % 4;
+                let dots: String = ".".repeat(dot_count);
+
                 let counter = if self.progress_total > 0 && self.phase == AppPhase::Scanning {
                     format!(
                         " ({}/{})",
@@ -929,19 +1090,23 @@ impl TidyMacApp {
                     String::new()
                 };
                 ui.label(
-                    egui::RichText::new(format!("{}{}", self.progress_label, counter))
+                    egui::RichText::new(format!("{}{}{}", self.progress_label, dots, counter))
                         .size(12.0)
                         .color(TEXT_SECONDARY),
                 );
             });
+        } else {
+            // Reset progress animation when idle
+            self.anim_progress = 0.0;
         }
 
-        // Last cleanup freed
+        // Last cleanup freed — success banner with glow
         if self.cleaned_bytes > 0 && self.phase == AppPhase::Idle {
             ui.add_space(6.0);
             egui::Frame::NONE
-                .fill(egui::Color32::from_rgb(25, 50, 30))
+                .fill(egui::Color32::from_rgb(22, 45, 28))
                 .corner_radius(egui::CornerRadius::same(8))
+                .stroke(egui::Stroke::new(0.5, egui::Color32::from_rgb(50, 120, 60)))
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1011,6 +1176,11 @@ impl TidyMacApp {
 
         let filter = self.search_filter.to_lowercase();
 
+        // Ensure hover state vec matches category count
+        if self.category_hover.len() != self.categories.len() {
+            self.category_hover.resize(self.categories.len(), 0.0);
+        }
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1019,7 +1189,6 @@ impl TidyMacApp {
                         let cat = &self.categories[i];
                         let matches_label = cat.label.to_lowercase().contains(&filter);
                         let matches_name = cat.name.to_lowercase().contains(&filter);
-                        // Also check file paths in scan results
                         let matches_files = cat.scan_result.as_ref().map_or(false, |r| {
                             r.entries.iter().any(|e| {
                                 e.path.to_string_lossy().to_lowercase().contains(&filter)
@@ -1029,13 +1198,17 @@ impl TidyMacApp {
                             continue;
                         }
                     }
-                    Self::render_category_row(ui, &mut self.categories[i]);
+                    let hover_t = self.category_hover[i];
+                    let resp = Self::render_category_row(ui, &mut self.categories[i], hover_t);
+                    // Update hover state
+                    let target = if resp.hovered() { 1.0 } else { 0.0 };
+                    self.category_hover[i] = lerp_f32(self.category_hover[i], target, 0.15);
                     ui.add_space(4.0);
                 }
             });
     }
 
-    fn render_category_row(ui: &mut egui::Ui, cat: &mut CategoryState) {
+    fn render_category_row(ui: &mut egui::Ui, cat: &mut CategoryState, hover_t: f32) -> egui::Response {
         let selected_size = cat.selected_bytes();
         let total_size = cat.scan_result.as_ref().map(|r| r.total_bytes).unwrap_or(0);
 
@@ -1051,13 +1224,15 @@ impl TidyMacApp {
             )
         };
 
-        let card_fill = if cat.expanded { CARD_EXPANDED } else { CARD_FILL };
+        let base_fill = if cat.expanded { CARD_EXPANDED } else { CARD_FILL };
+        let card_fill = lerp_color(base_fill, CARD_HOVER, hover_t);
+        let border_color = lerp_color(BORDER, BORDER_HOVER, hover_t);
 
-        egui::Frame::NONE
+        let frame_resp = egui::Frame::NONE
             .fill(card_fill)
             .corner_radius(egui::CornerRadius::same(10))
             .inner_margin(egui::Margin::symmetric(12, 10))
-            .stroke(egui::Stroke::new(0.5, BORDER))
+            .stroke(egui::Stroke::new(0.5 + hover_t * 0.5, border_color))
             .show(ui, |ui| {
                 // ── Header row ──
                 ui.horizontal(|ui| {
@@ -1245,6 +1420,9 @@ impl TidyMacApp {
                         }
                     });
             });
+
+        // Return response for hover detection
+        ui.interact(frame_resp.response.rect, egui::Id::new("cat_hover").with(cat.name), egui::Sense::hover())
     }
 
     fn render_scan_dashboard(&self, ui: &mut egui::Ui) {
@@ -1314,12 +1492,35 @@ impl TidyMacApp {
                             },
                         );
 
-                        // Color bar
+                        // Color bar with gradient + highlight
                         let (bar_rect, _) = ui.allocate_exact_size(
                             egui::vec2(bar_w, bar_h),
                             egui::Sense::hover(),
                         );
-                        ui.painter().rect_filled(bar_rect, 3.0, *color);
+                        let painter = ui.painter();
+                        let lighter = lerp_color(*color, egui::Color32::WHITE, 0.25);
+                        let steps = 10.min(bar_w as usize);
+                        if steps > 0 {
+                            let slice_w = bar_w / steps as f32;
+                            for s in 0..steps {
+                                let t = s as f32 / steps as f32;
+                                let c = lerp_color(lighter, *color, t);
+                                let x = bar_rect.min.x + s as f32 * slice_w;
+                                let slice = egui::Rect::from_min_size(
+                                    egui::pos2(x, bar_rect.min.y),
+                                    egui::vec2(slice_w + 1.0, bar_h),
+                                );
+                                painter.rect_filled(slice, 0.0, c);
+                            }
+                            // Top highlight
+                            let hl = egui::Rect::from_min_size(
+                                bar_rect.min,
+                                egui::vec2(bar_w, bar_h * 0.4),
+                            );
+                            painter.rect_filled(hl, 3.0, egui::Color32::from_white_alpha(15));
+                        } else {
+                            painter.rect_filled(bar_rect, 3.0, *color);
+                        }
 
                         // Size on the right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1338,13 +1539,22 @@ impl TidyMacApp {
         ui.add_space(6.0);
     }
 
-    fn render_summary(&self, ui: &mut egui::Ui) {
+    fn render_summary(&mut self, ui: &mut egui::Ui) {
         let total: u64 = self
             .categories
             .iter()
             .filter(|c| c.selected && !c.is_report_only)
             .map(|c| c.selected_bytes())
             .sum();
+
+        // Animate the displayed size
+        let target = total as f64;
+        self.anim_summary_size += (target - self.anim_summary_size) * 0.12;
+        if (self.anim_summary_size - target).abs() > 100.0 {
+            ui.ctx().request_repaint();
+        } else {
+            self.anim_summary_size = target;
+        }
 
         ui.add_space(8.0);
 
@@ -1361,11 +1571,14 @@ impl TidyMacApp {
                             .color(TEXT_SECONDARY),
                     );
                     ui.add_space(4.0);
+
+                    let display_size = self.anim_summary_size as u64;
+                    let size_color = if display_size > 0 { GREEN } else { TEXT_SECONDARY };
                     ui.label(
-                        egui::RichText::new(utils::format_size(total))
+                        egui::RichText::new(utils::format_size(display_size))
                             .size(32.0)
                             .strong()
-                            .color(GREEN),
+                            .color(size_color),
                     );
                 });
             });
@@ -1777,6 +1990,7 @@ impl TidyMacApp {
             .min_size(egui::vec2(80.0, 30.0));
             if ui.add(back_btn).clicked() {
                 self.view_mode = ViewMode::Main;
+                self.view_alpha = 0.0; // trigger fade-in
             }
 
             ui.add_space(8.0);
@@ -1826,22 +2040,66 @@ impl TidyMacApp {
             }
         });
 
-        // Progress
+        // Custom indeterminate progress bar
         if self.analyzer_scanning {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let t = (ui.input(|i| i.time) % 2.0) as f32 / 2.0;
-                let bar = egui::ProgressBar::new(t)
-                    .animate(true)
-                    .desired_width(ui.available_width() - 16.0);
-                ui.add(bar);
+                let bar_height = 14.0;
+                let bar_width = ui.available_width() - 16.0;
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(bar_width, bar_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(bar_rect, 7.0, egui::Color32::from_rgb(35, 35, 50));
+
+                // Indeterminate sliding highlight
+                let time = ui.input(|i| i.time) as f32;
+                let cycle = (time * 0.5).fract();
+                let blob_w = bar_width * 0.35;
+                let blob_x = bar_rect.min.x + cycle * (bar_width + blob_w) - blob_w;
+                let blob_left = blob_x.max(bar_rect.min.x);
+                let blob_right = (blob_x + blob_w).min(bar_rect.max.x);
+                if blob_right > blob_left {
+                    let blob_rect = egui::Rect::from_min_max(
+                        egui::pos2(blob_left, bar_rect.min.y),
+                        egui::pos2(blob_right, bar_rect.max.y),
+                    );
+                    // Gradient blob
+                    let steps = 12;
+                    let sw = (blob_right - blob_left) / steps as f32;
+                    for s in 0..steps {
+                        let t = s as f32 / steps as f32;
+                        // Fade in then fade out
+                        let alpha = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
+                        let color = lerp_color(
+                            egui::Color32::from_rgb(35, 35, 50),
+                            ACCENT,
+                            alpha * 0.8,
+                        );
+                        let x = blob_rect.min.x + s as f32 * sw;
+                        let slice = egui::Rect::from_min_size(
+                            egui::pos2(x, blob_rect.min.y),
+                            egui::vec2(sw + 1.0, bar_height),
+                        );
+                        painter.rect_filled(slice, 0.0, color);
+                    }
+                    // Highlight
+                    let hl = egui::Rect::from_min_size(
+                        blob_rect.min,
+                        egui::vec2(blob_right - blob_left, bar_height * 0.4),
+                    );
+                    painter.rect_filled(hl, 7.0, egui::Color32::from_white_alpha(12));
+                }
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
+                let time = ui.input(|i| i.time);
+                let dots: String = ".".repeat((time * 3.0) as usize % 4);
                 ui.label(
-                    egui::RichText::new(&self.progress_label)
+                    egui::RichText::new(format!("{}{}", self.progress_label, dots))
                         .size(12.0)
                         .color(TEXT_SECONDARY),
                 );
@@ -2164,13 +2422,18 @@ impl TidyMacApp {
 
                 // Current memory stats
                 let (used, total) = Self::get_memory_info();
-                let pct = if total > 0 {
+                let target_pct = if total > 0 {
                     used as f32 / total as f32
                 } else {
                     0.0
                 };
+                self.anim_mem_pct = lerp_f32(self.anim_mem_pct, target_pct, 0.08);
+                let pct = self.anim_mem_pct;
+                if (pct - target_pct).abs() > 0.001 {
+                    ui.ctx().request_repaint();
+                }
 
-                // Memory bar
+                // Memory bar with gradient
                 let bar_height = 10.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_height),
@@ -2180,10 +2443,6 @@ impl TidyMacApp {
                 painter.rect_filled(bar_rect, 5.0, egui::Color32::from_rgb(40, 40, 55));
 
                 let used_width = bar_rect.width() * pct;
-                let used_rect = egui::Rect::from_min_size(
-                    bar_rect.min,
-                    egui::vec2(used_width, bar_height),
-                );
                 let mem_color = if pct < 0.6 {
                     GREEN
                 } else if pct < 0.8 {
@@ -2191,7 +2450,34 @@ impl TidyMacApp {
                 } else {
                     egui::Color32::from_rgb(220, 60, 60)
                 };
-                painter.rect_filled(used_rect, 5.0, mem_color);
+
+                if used_width > 1.0 {
+                    let color_start = lerp_color(GREEN, mem_color, 0.3);
+                    let steps = 16;
+                    let slice_w = used_width / steps as f32;
+                    for s in 0..steps {
+                        let t = s as f32 / steps as f32;
+                        let color = lerp_color(color_start, mem_color, t);
+                        let x = bar_rect.min.x + s as f32 * slice_w;
+                        let slice = egui::Rect::from_min_size(
+                            egui::pos2(x, bar_rect.min.y),
+                            egui::vec2(slice_w + 1.0, bar_height),
+                        );
+                        painter.rect_filled(slice, 0.0, color);
+                    }
+                    // Highlight
+                    let hl = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(used_width, bar_height * 0.4),
+                    );
+                    painter.rect_filled(hl, 5.0, egui::Color32::from_white_alpha(15));
+                    // Clean edge
+                    let used_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(used_width, bar_height),
+                    );
+                    painter.rect_stroke(used_rect, 5.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 55)), egui::epaint::StrokeKind::Outside);
+                }
 
                 ui.add_space(4.0);
 
@@ -2478,6 +2764,26 @@ impl eframe::App for TidyMacApp {
             ctx.request_repaint();
         }
 
+        // ── Hover animation tick ──
+        // Hover states are updated during render_category_row via the returned response
+        let mut any_hover_animating = false;
+        for i in 0..self.category_hover.len() {
+            // Decay toward 0 if not being actively set to 1 during render
+            // (actual hover detection happens in render_category_list)
+            if (self.category_hover[i]).abs() > 0.01 {
+                any_hover_animating = true;
+            }
+        }
+        if any_hover_animating {
+            ctx.request_repaint();
+        }
+
+        // ── View transition alpha ──
+        self.view_alpha = lerp_f32(self.view_alpha, 1.0, 0.12);
+        if self.view_alpha < 0.99 {
+            ctx.request_repaint();
+        }
+
         // Detect dropped files
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files
@@ -2508,6 +2814,12 @@ impl eframe::App for TidyMacApp {
                     .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
+                // Apply view transition alpha
+                let alpha = (self.view_alpha * 255.0) as u8;
+                if alpha < 255 {
+                    ui.set_opacity(self.view_alpha);
+                }
+
                 match self.view_mode {
                     ViewMode::Main => {
                         self.render_header(ui);
