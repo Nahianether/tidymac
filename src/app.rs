@@ -123,7 +123,7 @@ struct DeleteItem {
 
 pub enum BgMessage {
     ScanComplete(String, ScanResult),
-    AllScansComplete,
+    AllScansComplete { smart_clean: bool },
     DeletedFile(String, PathBuf, u64),
     DeleteError(String, PathBuf, String),
     AllCleansComplete,
@@ -160,6 +160,8 @@ pub struct TidyMacApp {
     phase: AppPhase,
     receiver: Option<mpsc::Receiver<BgMessage>>,
     progress_label: String,
+    progress_total: usize,
+    progress_completed: usize,
     confirm_dialog: ConfirmDialog,
     errors: Vec<String>,
     cleaned_bytes: u64,
@@ -175,6 +177,10 @@ pub struct TidyMacApp {
     ram_before: Option<(u64, u64)>,
     ram_after: Option<(u64, u64)>,
     ram_error: Option<String>,
+    search_filter: String,
+    clean_report: Vec<String>,
+    dropped_files: Vec<PathBuf>,
+    drop_confirm_visible: bool,
 }
 
 // ── App impl ───────────────────────────────────────────────────────────
@@ -266,6 +272,8 @@ impl TidyMacApp {
             phase: AppPhase::Idle,
             receiver: None,
             progress_label: String::new(),
+            progress_total: 0,
+            progress_completed: 0,
             confirm_dialog: ConfirmDialog {
                 visible: false,
                 shred_mode: false,
@@ -287,6 +295,10 @@ impl TidyMacApp {
             ram_before: None,
             ram_after: None,
             ram_error: None,
+            search_filter: String::new(),
+            clean_report: vec![],
+            dropped_files: vec![],
+            drop_confirm_visible: false,
         }
     }
 
@@ -297,6 +309,8 @@ impl TidyMacApp {
         self.progress_label = "Starting scan...".to_string();
         self.errors.clear();
         self.cleaned_bytes = 0;
+        self.progress_total = self.categories.len();
+        self.progress_completed = 0;
 
         for cat in &mut self.categories {
             cat.scan_result = None;
@@ -313,7 +327,52 @@ impl TidyMacApp {
                 let result = cleaner.scan();
                 let _ = tx.send(BgMessage::ScanComplete(cleaner.name().to_string(), result));
             }
-            let _ = tx.send(BgMessage::AllScansComplete);
+            let _ = tx.send(BgMessage::AllScansComplete { smart_clean: false });
+        });
+    }
+
+    fn start_smart_clean(&mut self) {
+        self.phase = AppPhase::Scanning;
+        self.progress_label = "Smart Clean: scanning...".to_string();
+        self.errors.clear();
+        self.cleaned_bytes = 0;
+
+        // Safe categories for smart clean
+        let safe: &[&str] = &[
+            "system-caches",
+            "app-logs",
+            "browser-caches",
+            "ds-store",
+            "trash",
+            "empty-folders",
+            "screenshots",
+        ];
+
+        // Deselect all first, then select only safe categories
+        for cat in &mut self.categories {
+            cat.scan_result = None;
+            cat.entry_selected.clear();
+            cat.selected = safe.contains(&cat.name);
+        }
+
+        let safe_names: Vec<String> = safe.iter().map(|s| s.to_string()).collect();
+        self.progress_total = safe_names.len();
+        self.progress_completed = 0;
+
+        let (tx, rx) = mpsc::channel::<BgMessage>();
+        self.receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            let cleaners = crate::categories::all_cleaners(104_857_600, None);
+            for cleaner in &cleaners {
+                if !safe_names.contains(&cleaner.name().to_string()) {
+                    continue;
+                }
+                let _ = tx.send(BgMessage::Progress(cleaner.label().to_string()));
+                let result = cleaner.scan();
+                let _ = tx.send(BgMessage::ScanComplete(cleaner.name().to_string(), result));
+            }
+            let _ = tx.send(BgMessage::AllScansComplete { smart_clean: true });
         });
     }
 
@@ -322,6 +381,7 @@ impl TidyMacApp {
         self.progress_label = "Starting cleanup...".to_string();
         self.confirm_dialog.visible = false;
         self.cleaned_bytes = 0;
+        self.clean_report.clear();
 
         let mut items: Vec<DeleteItem> = Vec::new();
         for cat in &self.categories {
@@ -372,6 +432,8 @@ impl TidyMacApp {
     }
 
     fn drain_messages(&mut self) {
+        let mut trigger_smart_confirm = false;
+
         if let Some(ref rx) = self.receiver {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
@@ -384,13 +446,23 @@ impl TidyMacApp {
                             cat.scan_result = Some(result);
                             cat.entry_selected = vec![true; count];
                         }
+                        self.progress_completed += 1;
                     }
-                    BgMessage::AllScansComplete => {
+                    BgMessage::AllScansComplete { smart_clean } => {
                         self.phase = AppPhase::Idle;
                         self.progress_label.clear();
+                        if smart_clean {
+                            trigger_smart_confirm = true;
+                        }
                     }
                     BgMessage::DeletedFile(cat_name, path, freed) => {
                         self.cleaned_bytes += freed;
+                        self.clean_report.push(format!(
+                            "[{}] {} ({})",
+                            cat_name,
+                            path.display(),
+                            utils::format_size(freed),
+                        ));
                         if let Some(cat) = self.categories.iter_mut().find(|c| c.name == cat_name) {
                             if let Some(ref mut result) = cat.scan_result {
                                 if let Some(idx) = result.entries.iter().position(|e| e.path == path)
@@ -430,6 +502,15 @@ impl TidyMacApp {
                         self.ram_optimizing = false;
                     }
                 }
+            }
+        }
+
+        if trigger_smart_confirm {
+            let has_items = self.categories.iter().any(|c| {
+                c.selected && !c.is_report_only && c.selected_count() > 0
+            });
+            if has_items {
+                self.show_confirm_dialog(false);
             }
         }
     }
@@ -773,9 +854,10 @@ impl TidyMacApp {
             .any(|c| c.selected && !c.is_report_only && c.selected_count() > 0);
         let can_shred = !is_busy && has_scanned && has_any_selected;
 
-        if has_scanned {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+
+            if has_scanned {
                 let shred_btn = egui::Button::new(
                     egui::RichText::new("Secure Delete")
                         .size(12.0)
@@ -795,25 +877,59 @@ impl TidyMacApp {
                 {
                     self.show_confirm_dialog(true);
                 }
-            });
-        }
+
+                ui.add_space(4.0);
+            }
+
+            // Smart Clean button (green)
+            let smart_btn = egui::Button::new(
+                egui::RichText::new("Smart Clean")
+                    .size(12.0)
+                    .color(if is_busy {
+                        egui::Color32::from_rgb(80, 80, 90)
+                    } else {
+                        GREEN
+                    }),
+            )
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(110.0, 28.0));
+
+            if ui
+                .add_enabled(!is_busy, smart_btn)
+                .on_hover_text("Quick scan & clean safe categories (caches, logs, trash, screenshots)")
+                .clicked()
+            {
+                self.start_smart_clean();
+            }
+        });
 
         // Progress bar
         if is_busy {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let t = (ui.input(|i| i.time) % 2.0) as f32 / 2.0;
-                let bar = egui::ProgressBar::new(t)
-                    .animate(true)
+                let frac = if self.progress_total > 0 {
+                    self.progress_completed as f32 / self.progress_total as f32
+                } else {
+                    0.0
+                };
+                let bar = egui::ProgressBar::new(frac)
                     .desired_width(ui.available_width() - 16.0);
                 ui.add(bar);
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
+                let counter = if self.progress_total > 0 && self.phase == AppPhase::Scanning {
+                    format!(
+                        " ({}/{})",
+                        self.progress_completed, self.progress_total
+                    )
+                } else {
+                    String::new()
+                };
                 ui.label(
-                    egui::RichText::new(&self.progress_label)
+                    egui::RichText::new(format!("{}{}", self.progress_label, counter))
                         .size(12.0)
                         .color(TEXT_SECONDARY),
                 );
@@ -838,6 +954,27 @@ impl TidyMacApp {
                             .size(14.0)
                             .color(GREEN),
                         );
+
+                        if !self.clean_report.is_empty() {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let export_btn = egui::Button::new(
+                                        egui::RichText::new("Export Report")
+                                            .size(11.0)
+                                            .color(ACCENT),
+                                    )
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .min_size(egui::vec2(90.0, 22.0));
+                                    if ui.add(export_btn).clicked() {
+                                        Self::export_report(
+                                            &self.clean_report,
+                                            self.cleaned_bytes,
+                                        );
+                                    }
+                                },
+                            );
+                        }
                     });
                 });
         }
@@ -846,10 +983,52 @@ impl TidyMacApp {
     }
 
     fn render_category_list(&mut self, ui: &mut egui::Ui) {
+        // Search / filter bar
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Filter:")
+                    .size(12.0)
+                    .color(TEXT_SECONDARY),
+            );
+            let te = egui::TextEdit::singleline(&mut self.search_filter)
+                .desired_width(ui.available_width() - 60.0)
+                .hint_text("Search categories...")
+                .font(egui::FontId::proportional(12.0));
+            ui.add(te);
+            if !self.search_filter.is_empty() {
+                let clear_btn = egui::Button::new(
+                    egui::RichText::new("X").size(11.0).color(TEXT_SECONDARY),
+                )
+                .corner_radius(egui::CornerRadius::same(4))
+                .min_size(egui::vec2(22.0, 22.0));
+                if ui.add(clear_btn).clicked() {
+                    self.search_filter.clear();
+                }
+            }
+        });
+        ui.add_space(4.0);
+
+        let filter = self.search_filter.to_lowercase();
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for i in 0..self.categories.len() {
+                    if !filter.is_empty() {
+                        let cat = &self.categories[i];
+                        let matches_label = cat.label.to_lowercase().contains(&filter);
+                        let matches_name = cat.name.to_lowercase().contains(&filter);
+                        // Also check file paths in scan results
+                        let matches_files = cat.scan_result.as_ref().map_or(false, |r| {
+                            r.entries.iter().any(|e| {
+                                e.path.to_string_lossy().to_lowercase().contains(&filter)
+                            })
+                        });
+                        if !matches_label && !matches_name && !matches_files {
+                            continue;
+                        }
+                    }
                     Self::render_category_row(ui, &mut self.categories[i]);
                     ui.add_space(4.0);
                 }
@@ -2069,6 +2248,192 @@ impl TidyMacApp {
         ui.add_space(6.0);
     }
 
+    fn export_report(report: &[String], total_freed: u64) {
+        let desktop = dirs::desktop_dir().unwrap_or_else(|| {
+            crate::utils::home_dir().join("Desktop")
+        });
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = desktop.join(format!("TidyMac_Report_{}.txt", timestamp));
+
+        let mut content = String::new();
+        content.push_str("=== TidyMac Cleaning Report ===\n\n");
+        content.push_str(&format!(
+            "Total freed: {}\n",
+            utils::format_size(total_freed)
+        ));
+        content.push_str(&format!("Files cleaned: {}\n\n", report.len()));
+        content.push_str("--- Details ---\n\n");
+        for line in report {
+            content.push_str(line);
+            content.push('\n');
+        }
+
+        if std::fs::write(&path, &content).is_ok() {
+            // Open the report file in default text editor
+            let _ = std::process::Command::new("open").arg(&path).spawn();
+        }
+    }
+
+    fn start_drop_shred(&mut self) {
+        self.phase = AppPhase::Cleaning;
+        self.progress_label = "Shredding dropped files...".to_string();
+        self.drop_confirm_visible = false;
+        self.cleaned_bytes = 0;
+
+        let files = std::mem::take(&mut self.dropped_files);
+
+        let (tx, rx) = mpsc::channel::<BgMessage>();
+        self.receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            for path in &files {
+                let tx_ref = &tx;
+                let mut progress_fn = |msg: &str| {
+                    let _ = tx_ref.send(BgMessage::Progress(msg.to_string()));
+                };
+                match crate::shredder::shred_file(path, &mut progress_fn) {
+                    Ok(freed) => {
+                        let _ = tx.send(BgMessage::DeletedFile(
+                            "drop-shred".to_string(),
+                            path.clone(),
+                            freed,
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BgMessage::DeleteError(
+                            "drop-shred".to_string(),
+                            path.clone(),
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
+            let _ = tx.send(BgMessage::AllShredsComplete);
+        });
+    }
+
+    fn render_drop_confirm(&mut self, ctx: &egui::Context) {
+        let mut should_shred = false;
+        let mut should_cancel = false;
+
+        egui::Area::new(egui::Id::new("drop_overlay"))
+            .fixed_pos(egui::Pos2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let screen = ui.ctx().screen_rect();
+                ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter()
+                    .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+            });
+
+        egui::Window::new("")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([380.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.add_space(12.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("[!]").size(40.0));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Secure Shred Dropped Files")
+                            .size(20.0)
+                            .strong()
+                            .color(YELLOW),
+                    );
+                });
+                ui.add_space(10.0);
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Securely shred {} file(s)? Data will be overwritten\nwith 3 passes before deletion.",
+                        self.dropped_files.len()
+                    ))
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(200, 200, 210)),
+                );
+                ui.add_space(8.0);
+
+                egui::Frame::NONE
+                    .fill(INSET_FILL)
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        for f in &self.dropped_files {
+                            let name = f
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "\u{2022} {} ({})",
+                                    name,
+                                    utils::format_size(size)
+                                ))
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(180, 180, 195)),
+                            );
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("This action cannot be undone.")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(200, 100, 100)),
+                    );
+                });
+                ui.add_space(14.0);
+
+                ui.columns(2, |cols| {
+                    cols[0].vertical_centered(|ui| {
+                        let btn = egui::Button::new(
+                            egui::RichText::new("Cancel")
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(180, 180, 200)),
+                        )
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(150.0, 36.0));
+                        if ui.add(btn).clicked() {
+                            should_cancel = true;
+                        }
+                    });
+                    cols[1].vertical_centered(|ui| {
+                        let btn = egui::Button::new(
+                            egui::RichText::new("Shred Files")
+                                .size(14.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(180, 130, 30))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(150.0, 36.0));
+                        if ui.add(btn).clicked() {
+                            should_shred = true;
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+            });
+
+        if should_cancel {
+            self.drop_confirm_visible = false;
+            self.dropped_files.clear();
+        }
+        if should_shred {
+            self.start_drop_shred();
+        }
+    }
+
     fn render_errors(&self, ui: &mut egui::Ui) {
         if self.errors.is_empty() {
             return;
@@ -2111,6 +2476,22 @@ impl eframe::App for TidyMacApp {
 
         if self.phase != AppPhase::Idle || self.analyzer_scanning || self.ram_optimizing {
             ctx.request_repaint();
+        }
+
+        // Detect dropped files
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() && self.phase == AppPhase::Idle {
+            self.dropped_files = dropped;
+            self.drop_confirm_visible = true;
+        }
+
+        if self.drop_confirm_visible {
+            self.render_drop_confirm(ctx);
         }
 
         if self.confirm_dialog.visible {

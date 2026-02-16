@@ -420,6 +420,92 @@ The following features are planned for implementation, in order of priority.
 
 ---
 
+### Phase 14: Smart Clean
+
+**Goal:** One-click scan & clean of safe categories without manual selection.
+
+**What it does:**
+- "Smart Clean" button in the action bar
+- Auto-selects only safe categories: system caches, app logs, browser caches, .DS_Store, trash, empty folders, old screenshots
+- Runs a targeted scan (only those categories, not all)
+- After scan completes, auto-opens the confirm dialog showing what will be cleaned
+- User still confirms before deletion — no silent deletes
+
+**Implementation:**
+- In `src/app.rs`:
+  - New method `start_smart_clean()` — selects safe categories, runs scan on them only
+  - `BgMessage::AllScansComplete` extended with `smart_clean: bool` flag
+  - When smart_clean scan finishes, auto-calls `show_confirm_dialog(false)`
+  - "Smart Clean" button rendered in action bar with green text
+
+**Dependencies:** None
+
+---
+
+### Phase 15: Drag & Drop Shredder
+
+**Goal:** Drop files/folders onto the app window to securely shred them.
+
+**What it does:**
+- Detects files dragged and dropped onto the TidyMac window
+- Shows a confirmation dialog listing dropped files with their names and sizes
+- On confirm, runs the 3-pass secure shred on all dropped files
+- Works regardless of current view (main or analyzer)
+
+**Implementation:**
+- In `src/app.rs`:
+  - Fields: `dropped_files: Vec<PathBuf>`, `drop_confirm_visible: bool`
+  - In `update()`: detect dropped files via `ctx.input(|i| i.raw.dropped_files)`
+  - New method `render_drop_confirm()` — modal dialog listing files, Cancel/Shred buttons
+  - New method `start_drop_shred()` — spawns background thread to shred files using `crate::shredder::shred_file()`
+  - Reuses existing `BgMessage::AllShredsComplete` for completion
+
+**Dependencies:** None
+
+---
+
+### Phase 16: Cleaning Report / Export
+
+**Goal:** Generate a summary report of what was cleaned for record-keeping.
+
+**What it does:**
+- After cleaning, an "Export Report" button appears next to the "freed" summary
+- Clicking it saves a text file to Desktop: `TidyMac_Report_<timestamp>.txt`
+- Report contains: total freed, file count, and a detailed list of every deleted file with category and size
+- Automatically opens the report in the default text editor
+
+**Implementation:**
+- In `src/app.rs`:
+  - Field: `clean_report: Vec<String>` — populated during `DeletedFile` message handling
+  - Static method `export_report()` — writes report to `~/Desktop/TidyMac_Report_<unix_ts>.txt` and opens it
+  - "Export Report" button shown in the success card after cleaning
+
+**Dependencies:** None
+
+---
+
+### Phase 17: Category Search / Filter
+
+**Goal:** Quick text filter to search categories by name or file path.
+
+**What it does:**
+- Text input above the category list: "Filter: [search box] [X]"
+- Filters categories in real-time as you type
+- Matches against: category label, category name, and file paths in scan results
+- Clear button (X) to reset filter
+- When filter is empty, all categories are shown
+
+**Implementation:**
+- In `src/app.rs`:
+  - Field: `search_filter: String`
+  - In `render_category_list()`: add `TextEdit::singleline` above the scroll area
+  - Filter loop: skip categories where label, name, and file paths don't match the filter text
+  - Case-insensitive matching
+
+**Dependencies:** None
+
+---
+
 ## Implementation Order
 
 | Phase | Feature | New Files | Estimated Scope |
@@ -437,3 +523,7 @@ The following features are planned for implementation, in order of priority.
 | 11 | Broken Symlinks Finder | `src/categories/broken_symlinks.rs` | Small — follows cleaner pattern |
 | 12 | Empty Folders Cleaner | `src/categories/empty_folders.rs` | Small — follows cleaner pattern |
 | 13 | Screenshot Cleaner | `src/categories/screenshots.rs` | Small — follows cleaner pattern |
+| 14 | Smart Clean | UI in `src/app.rs` | Small — targeted scan + auto-confirm |
+| 15 | Drag & Drop Shredder | UI in `src/app.rs` | Small — drop detection + shred |
+| 16 | Cleaning Report / Export | UI in `src/app.rs` | Small — file write + open |
+| 17 | Category Search / Filter | UI in `src/app.rs` | Small — text filter |
