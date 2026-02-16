@@ -1,6 +1,7 @@
 use crate::cleaner::{Cleaner, ScanEntry, ScanResult};
 use crate::utils;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 /// Screenshots older than 30 days are marked for cleanup.
@@ -14,28 +15,35 @@ const VALID_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "tiff", "gif", "mov", 
 
 pub struct Screenshots;
 
-fn get_screenshot_dir() -> PathBuf {
-    // Check if user has a custom screenshot location
-    if let Ok(output) = std::process::Command::new("defaults")
-        .args(["read", "com.apple.screencapture", "location"])
-        .output()
-    {
-        if output.status.success() {
-            let location = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !location.is_empty() {
-                let path = PathBuf::from(&location);
-                if path.exists() {
-                    return path;
+/// Cached screenshot directory — only runs `defaults read` once per process.
+static SCREENSHOT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn get_screenshot_dir() -> &'static PathBuf {
+    SCREENSHOT_DIR.get_or_init(|| {
+        // Check if user has a custom screenshot location
+        if let Ok(output) = std::process::Command::new("defaults")
+            .args(["read", "com.apple.screencapture", "location"])
+            .output()
+        {
+            if output.status.success() {
+                let location = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !location.is_empty() {
+                    let path = PathBuf::from(&location);
+                    if path.exists() {
+                        return path;
+                    }
                 }
             }
         }
-    }
-    // Default: ~/Desktop
-    utils::home_dir().join("Desktop")
+        // Default: ~/Desktop
+        utils::home_dir().join("Desktop")
+    })
 }
 
 fn is_screenshot(name: &str) -> bool {
-    SCREENSHOT_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    SCREENSHOT_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn has_valid_extension(name: &str) -> bool {
@@ -77,7 +85,7 @@ impl Cleaner for Screenshots {
 
         let max_age = Duration::from_secs(MAX_AGE_DAYS * 24 * 60 * 60);
 
-        let dir_entries = match std::fs::read_dir(&screenshot_dir) {
+        let dir_entries = match std::fs::read_dir(screenshot_dir) {
             Ok(rd) => rd,
             Err(_) => {
                 return ScanResult {

@@ -3,6 +3,9 @@ use crate::utils;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
+/// Maximum depth to traverse.
+const MAX_DEPTH: usize = 10;
+
 /// Directories to skip during large file scan.
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -10,7 +13,44 @@ const SKIP_DIRS: &[&str] = &[
     ".Trash",
     ".cargo",
     ".rustup",
+    "node_modules",
+    ".npm",
+    ".venv",
+    "venv",
+    ".m2",
+    ".gradle",
+    ".docker",
+    ".vscode",
+    ".idea",
+    "__pycache__",
+    ".tox",
+    "target",
+    ".pub-cache",
+    "Pods",
+    ".cocoapods",
+    "bower_components",
+    ".bundle",
+    ".gem",
+    ".rbenv",
+    ".pyenv",
+    ".nvm",
 ];
+
+/// macOS app/bundle extensions to skip walking into.
+const SKIP_EXTENSIONS: &[&str] = &[
+    ".app",
+    ".photoslibrary",
+    ".musiclibrary",
+    ".tvlibrary",
+    ".vmwarevm",
+    ".parallels",
+];
+
+fn should_skip_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SKIP_DIRS.iter().any(|&skip| name == skip)
+        || SKIP_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
 
 pub struct LargeFiles {
     min_bytes: u64,
@@ -43,7 +83,6 @@ impl Cleaner for LargeFiles {
         if !self.root.exists() {
             errors.push(format!("Path does not exist: {}", self.root.display()));
             return ScanResult {
-    
                 entries,
                 total_bytes,
                 errors,
@@ -51,12 +90,13 @@ impl Cleaner for LargeFiles {
         }
 
         let walker = WalkDir::new(&self.root)
+            .max_depth(MAX_DEPTH)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
-                    return !SKIP_DIRS.iter().any(|&skip| name == skip);
+                    return !should_skip_dir(&name);
                 }
                 true
             });
@@ -76,11 +116,9 @@ impl Cleaner for LargeFiles {
             }
         }
 
-        // Sort by size descending — biggest files first
         entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
         ScanResult {
-
             entries,
             total_bytes,
             errors,

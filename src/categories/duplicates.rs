@@ -1,5 +1,6 @@
 use crate::cleaner::{Cleaner, ScanEntry, ScanResult};
 use crate::utils;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,6 +15,9 @@ const MAX_SIZE: u64 = 500_000_000;
 /// Bytes to read for partial hash (first 4 KB)
 const PARTIAL_READ: usize = 4096;
 
+/// Maximum walk depth.
+const MAX_DEPTH: usize = 8;
+
 /// Directories/bundles to skip inside scanned folders
 const SKIP_EXTENSIONS: &[&str] = &[
     ".photoslibrary",
@@ -25,14 +29,30 @@ const SKIP_EXTENSIONS: &[&str] = &[
     ".app",
 ];
 
+/// Directory names to skip.
+const SKIP_DIRS: &[&str] = &[
+    ".Trash",
+    "node_modules",
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    "target",
+    ".cargo",
+    ".rustup",
+    ".npm",
+    ".m2",
+    ".gradle",
+    "Pods",
+];
+
 pub struct DuplicateFinder;
 
 fn should_skip_dir(name: &str) -> bool {
     let lower = name.to_lowercase();
-    SKIP_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-        || lower == ".trash"
-        || lower == "node_modules"
-        || lower == ".git"
+    SKIP_DIRS.iter().any(|&skip| name == skip)
+        || SKIP_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Compute blake3 hash of the first `n` bytes of a file.
@@ -81,7 +101,7 @@ impl Cleaner for DuplicateFinder {
             home.join("Pictures"),
         ];
 
-        // Pass 1: Group all files by size
+        // Pass 1: Group all files by size (single consolidated walk)
         let mut size_groups: HashMap<u64, Vec<PathBuf>> = HashMap::new();
 
         for dir in &dirs_to_scan {
@@ -89,6 +109,7 @@ impl Cleaner for DuplicateFinder {
                 continue;
             }
             for entry in WalkDir::new(dir)
+                .max_depth(MAX_DEPTH)
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| {
@@ -100,11 +121,10 @@ impl Cleaner for DuplicateFinder {
                 })
                 .filter_map(|e| e.ok())
             {
-                let path = entry.path();
-                if !path.is_file() {
+                if !entry.file_type().is_file() {
                     continue;
                 }
-                let size = match path.metadata() {
+                let size = match entry.metadata() {
                     Ok(m) => m.len(),
                     Err(_) => continue,
                 };
@@ -114,50 +134,72 @@ impl Cleaner for DuplicateFinder {
                 size_groups
                     .entry(size)
                     .or_default()
-                    .push(path.to_path_buf());
+                    .push(entry.into_path());
             }
         }
 
-        // Pass 2: For groups with 2+ files, compute partial hash
-        for (_size, paths) in &size_groups {
-            if paths.len() < 2 {
-                continue;
-            }
+        // Only keep groups with 2+ files (potential duplicates)
+        let candidate_groups: Vec<(u64, Vec<PathBuf>)> = size_groups
+            .into_iter()
+            .filter(|(_, paths)| paths.len() >= 2)
+            .collect();
 
-            let mut partial_groups: HashMap<blake3::Hash, Vec<&PathBuf>> = HashMap::new();
-            for path in paths {
-                if let Some(hash) = partial_hash(path) {
-                    partial_groups.entry(hash).or_default().push(path);
+        // Pass 2: Parallel partial hashing for size-matched groups
+        let partial_results: Vec<(u64, HashMap<blake3::Hash, Vec<PathBuf>>)> = candidate_groups
+            .into_par_iter()
+            .map(|(size, paths)| {
+                let mut partial_groups: HashMap<blake3::Hash, Vec<PathBuf>> = HashMap::new();
+                for path in paths {
+                    if let Some(hash) = partial_hash(&path) {
+                        partial_groups.entry(hash).or_default().push(path);
+                    }
+                }
+                (size, partial_groups)
+            })
+            .collect();
+
+        // Pass 3: Parallel full hashing for partial-hash matches
+        let mut full_hash_tasks: Vec<Vec<PathBuf>> = Vec::new();
+        for (_size, partial_groups) in &partial_results {
+            for (_phash, partial_matches) in partial_groups {
+                if partial_matches.len() >= 2 {
+                    full_hash_tasks.push(partial_matches.clone());
                 }
             }
+        }
 
-            // Pass 3: For matching partial hashes, compute full hash
-            for (_phash, partial_matches) in &partial_groups {
-                if partial_matches.len() < 2 {
+        let dup_groups: Vec<Vec<(PathBuf, blake3::Hash)>> = full_hash_tasks
+            .into_par_iter()
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .filter_map(|p| {
+                        let hash = full_hash(&p)?;
+                        Some((p, hash))
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Collect true duplicates from full hash groups
+        for group in &dup_groups {
+            let mut full_groups: HashMap<blake3::Hash, Vec<&PathBuf>> = HashMap::new();
+            for (path, hash) in group {
+                full_groups.entry(*hash).or_default().push(path);
+            }
+
+            for (_fhash, dupes) in &full_groups {
+                if dupes.len() < 2 {
                     continue;
                 }
-
-                let mut full_groups: HashMap<blake3::Hash, Vec<&PathBuf>> = HashMap::new();
-                for path in partial_matches {
-                    if let Some(hash) = full_hash(path) {
-                        full_groups.entry(hash).or_default().push(path);
-                    }
-                }
-
-                // For each group of true duplicates, keep the first, mark rest as entries
-                for (_fhash, dupes) in &full_groups {
-                    if dupes.len() < 2 {
-                        continue;
-                    }
-                    // Skip the first file (the "original"), mark the rest
-                    for dup_path in &dupes[1..] {
-                        let size = utils::entry_size(dup_path);
-                        total_bytes += size;
-                        entries.push(ScanEntry {
-                            path: dup_path.to_path_buf(),
-                            size_bytes: size,
-                        });
-                    }
+                // Skip the first file (the "original"), mark the rest
+                for dup_path in &dupes[1..] {
+                    let size = dup_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    total_bytes += size;
+                    entries.push(ScanEntry {
+                        path: dup_path.to_path_buf(),
+                        size_bytes: size,
+                    });
                 }
             }
         }

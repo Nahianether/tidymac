@@ -4,6 +4,9 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
+/// Maximum depth to traverse (avoids extremely deep trees).
+const MAX_DEPTH: usize = 8;
+
 /// Directories to skip during .DS_Store scan for performance.
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -13,6 +16,25 @@ const SKIP_DIRS: &[&str] = &[
     ".cargo",
     ".rustup",
     ".npm",
+    ".venv",
+    "venv",
+    ".m2",
+    ".gradle",
+    ".docker",
+    ".vscode",
+    ".idea",
+    "__pycache__",
+    ".tox",
+    "target",
+    ".pub-cache",
+    "Pods",
+    ".cocoapods",
+    "bower_components",
+    ".bundle",
+    ".gem",
+    ".rbenv",
+    ".pyenv",
+    ".nvm",
 ];
 
 pub struct DsStore {
@@ -45,7 +67,6 @@ impl Cleaner for DsStore {
         if !self.root.exists() {
             errors.push(format!("Path does not exist: {}", self.root.display()));
             return ScanResult {
-    
                 entries,
                 total_bytes,
                 errors,
@@ -53,10 +74,10 @@ impl Cleaner for DsStore {
         }
 
         let walker = WalkDir::new(&self.root)
+            .max_depth(MAX_DEPTH)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
-                // Skip certain directories for performance
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
                     return !SKIP_DIRS.iter().any(|&skip| name == skip);
@@ -77,7 +98,6 @@ impl Cleaner for DsStore {
         }
 
         ScanResult {
-
             entries,
             total_bytes,
             errors,

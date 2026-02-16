@@ -3561,6 +3561,7 @@ dependencies = [
  "dirs",
  "eframe",
  "libc",
+ "rayon",
  "sysinfo",
  "tray-icon",
  "walkdir",

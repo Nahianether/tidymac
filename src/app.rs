@@ -355,12 +355,26 @@ impl TidyMacApp {
         let (tx, rx) = mpsc::channel::<BgMessage>();
         self.receiver = Some(rx);
 
+        // Parallel scanning: spawn one thread per category
         std::thread::spawn(move || {
             let cleaners = crate::categories::all_cleaners(104_857_600, None);
-            for cleaner in &cleaners {
-                let _ = tx.send(BgMessage::Progress(cleaner.label().to_string()));
-                let result = cleaner.scan();
-                let _ = tx.send(BgMessage::ScanComplete(cleaner.name().to_string(), result));
+            let handles: Vec<_> = cleaners
+                .into_iter()
+                .map(|cleaner| {
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(BgMessage::Progress(cleaner.label().to_string()));
+                        let result = cleaner.scan();
+                        let _ = tx.send(BgMessage::ScanComplete(
+                            cleaner.name().to_string(),
+                            result,
+                        ));
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let _ = h.join();
             }
             let _ = tx.send(BgMessage::AllScansComplete { smart_clean: false });
         });
@@ -397,15 +411,27 @@ impl TidyMacApp {
         let (tx, rx) = mpsc::channel::<BgMessage>();
         self.receiver = Some(rx);
 
+        // Parallel scanning for smart clean
         std::thread::spawn(move || {
             let cleaners = crate::categories::all_cleaners(104_857_600, None);
-            for cleaner in &cleaners {
-                if !safe_names.contains(&cleaner.name().to_string()) {
-                    continue;
-                }
-                let _ = tx.send(BgMessage::Progress(cleaner.label().to_string()));
-                let result = cleaner.scan();
-                let _ = tx.send(BgMessage::ScanComplete(cleaner.name().to_string(), result));
+            let handles: Vec<_> = cleaners
+                .into_iter()
+                .filter(|c| safe_names.contains(&c.name().to_string()))
+                .map(|cleaner| {
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(BgMessage::Progress(cleaner.label().to_string()));
+                        let result = cleaner.scan();
+                        let _ = tx.send(BgMessage::ScanComplete(
+                            cleaner.name().to_string(),
+                            result,
+                        ));
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                let _ = h.join();
             }
             let _ = tx.send(BgMessage::AllScansComplete { smart_clean: true });
         });
@@ -752,8 +778,9 @@ impl TidyMacApp {
 
                 ui.add_space(6.0);
 
-                // Gradient bar
+                // Bar
                 let bar_height = 14.0;
+                let r = 7.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_height),
                     egui::Sense::hover(),
@@ -761,54 +788,33 @@ impl TidyMacApp {
                 let painter = ui.painter();
 
                 // Background
-                painter.rect_filled(bar_rect, 7.0, egui::Color32::from_rgb(40, 40, 55));
+                painter.rect_filled(bar_rect, r, egui::Color32::from_rgb(40, 40, 55));
 
-                // Used portion with gradient
+                // Used portion — rounded left, flat right (unless nearly full)
                 let used_width = bar_rect.width() * pct;
-                if used_width > 1.0 {
-                    let bar_color_start = if pct < 0.6 {
+                if used_width > 2.0 {
+                    let bar_color = if pct < 0.6 {
                         GREEN
-                    } else if pct < 0.8 {
-                        egui::Color32::from_rgb(180, 200, 50)
-                    } else {
-                        egui::Color32::from_rgb(220, 120, 40)
-                    };
-                    let bar_color_end = if pct < 0.6 {
-                        egui::Color32::from_rgb(50, 180, 100)
                     } else if pct < 0.8 {
                         YELLOW
                     } else {
                         egui::Color32::from_rgb(220, 60, 60)
                     };
 
-                    // Draw gradient with horizontal slices
-                    let steps = 20;
-                    let slice_w = used_width / steps as f32;
-                    for s in 0..steps {
-                        let t = s as f32 / steps as f32;
-                        let color = lerp_color(bar_color_start, bar_color_end, t);
-                        let x = bar_rect.min.x + s as f32 * slice_w;
-                        let slice = egui::Rect::from_min_size(
-                            egui::pos2(x, bar_rect.min.y),
-                            egui::vec2(slice_w + 1.0, bar_height),
-                        );
-                        painter.rect_filled(slice, 0.0, color);
-                    }
-
-                    // Round the ends by re-drawing the full used rect clipped with rounding
                     let used_rect = egui::Rect::from_min_size(
                         bar_rect.min,
                         egui::vec2(used_width, bar_height),
                     );
-                    // Overlay subtle highlight on top half for 3D effect
+                    let right_r = if pct > 0.95 { r } else { 0.0 };
+                    let fill_rounding = egui::CornerRadius { nw: r as u8, sw: r as u8, ne: right_r as u8, se: right_r as u8 };
+                    painter.rect_filled(used_rect, fill_rounding, bar_color);
+
+                    // Subtle highlight on top half for 3D effect
                     let highlight_rect = egui::Rect::from_min_size(
                         bar_rect.min,
                         egui::vec2(used_width, bar_height * 0.45),
                     );
-                    painter.rect_filled(highlight_rect, 7.0, egui::Color32::from_white_alpha(18));
-
-                    // Clip corners by redrawing background on the outside
-                    painter.rect_stroke(used_rect, 7.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(40, 40, 55)), egui::epaint::StrokeKind::Outside);
+                    painter.rect_filled(highlight_rect, fill_rounding, egui::Color32::from_white_alpha(18));
                 }
 
                 ui.add_space(4.0);
@@ -1009,51 +1015,29 @@ impl TidyMacApp {
                 let painter = ui.painter();
 
                 // Background pill
-                painter.rect_filled(bar_rect, 8.0, egui::Color32::from_rgb(35, 35, 50));
+                let rounding = 8.0;
+                painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(35, 35, 50));
 
-                // Filled portion with gradient
+                // Filled portion — rounded left, flat right (unless nearly full)
                 let filled_w = bar_rect.width() * frac;
                 if filled_w > 2.0 {
-                    let gradient_start = ACCENT;
-                    let gradient_end = egui::Color32::from_rgb(60, 200, 160);
-                    let steps = 24;
-                    let slice_w = filled_w / steps as f32;
-                    for s in 0..steps {
-                        let t = s as f32 / steps as f32;
-                        let color = lerp_color(gradient_start, gradient_end, t);
-                        let x = bar_rect.min.x + s as f32 * slice_w;
-                        let slice = egui::Rect::from_min_size(
-                            egui::pos2(x, bar_rect.min.y),
-                            egui::vec2(slice_w + 1.0, bar_height),
-                        );
-                        painter.rect_filled(slice, 0.0, color);
-                    }
+                    let filled_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(filled_w, bar_height),
+                    );
+                    let right_r = if frac > 0.95 { rounding } else { 0.0 };
+                    let fill_rounding = egui::CornerRadius {
+                        nw: rounding as u8, sw: rounding as u8,
+                        ne: right_r as u8, se: right_r as u8,
+                    };
+                    painter.rect_filled(filled_rect, fill_rounding, ACCENT);
 
                     // Highlight on top half for 3D depth
                     let highlight_rect = egui::Rect::from_min_size(
                         bar_rect.min,
                         egui::vec2(filled_w, bar_height * 0.4),
                     );
-                    painter.rect_filled(highlight_rect, 8.0, egui::Color32::from_white_alpha(20));
-
-                    // Shimmer effect — a bright moving band
-                    let time = ui.input(|i| i.time) as f32;
-                    let shimmer_x = bar_rect.min.x + ((time * 0.6).fract()) * filled_w;
-                    let shimmer_w = 30.0_f32.min(filled_w * 0.2);
-                    if shimmer_x + shimmer_w <= bar_rect.min.x + filled_w {
-                        let shimmer_rect = egui::Rect::from_min_size(
-                            egui::pos2(shimmer_x, bar_rect.min.y),
-                            egui::vec2(shimmer_w, bar_height),
-                        );
-                        painter.rect_filled(shimmer_rect, 0.0, egui::Color32::from_white_alpha(25));
-                    }
-
-                    // Clean pill outline
-                    let filled_rect = egui::Rect::from_min_size(
-                        bar_rect.min,
-                        egui::vec2(filled_w, bar_height),
-                    );
-                    painter.rect_stroke(filled_rect, 8.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 35, 50)), egui::epaint::StrokeKind::Outside);
+                    painter.rect_filled(highlight_rect, fill_rounding, egui::Color32::from_white_alpha(20));
                 }
 
                 // Percentage text centered in bar
@@ -1181,31 +1165,27 @@ impl TidyMacApp {
             self.category_hover.resize(self.categories.len(), 0.0);
         }
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for i in 0..self.categories.len() {
-                    if !filter.is_empty() {
-                        let cat = &self.categories[i];
-                        let matches_label = cat.label.to_lowercase().contains(&filter);
-                        let matches_name = cat.name.to_lowercase().contains(&filter);
-                        let matches_files = cat.scan_result.as_ref().map_or(false, |r| {
-                            r.entries.iter().any(|e| {
-                                e.path.to_string_lossy().to_lowercase().contains(&filter)
-                            })
-                        });
-                        if !matches_label && !matches_name && !matches_files {
-                            continue;
-                        }
-                    }
-                    let hover_t = self.category_hover[i];
-                    let resp = Self::render_category_row(ui, &mut self.categories[i], hover_t);
-                    // Update hover state
-                    let target = if resp.hovered() { 1.0 } else { 0.0 };
-                    self.category_hover[i] = lerp_f32(self.category_hover[i], target, 0.15);
-                    ui.add_space(4.0);
+        for i in 0..self.categories.len() {
+            if !filter.is_empty() {
+                let cat = &self.categories[i];
+                let matches_label = cat.label.to_lowercase().contains(&filter);
+                let matches_name = cat.name.to_lowercase().contains(&filter);
+                let matches_files = cat.scan_result.as_ref().map_or(false, |r| {
+                    r.entries.iter().any(|e| {
+                        e.path.to_string_lossy().to_lowercase().contains(&filter)
+                    })
+                });
+                if !matches_label && !matches_name && !matches_files {
+                    continue;
                 }
-            });
+            }
+            let hover_t = self.category_hover[i];
+            let resp = Self::render_category_row(ui, &mut self.categories[i], hover_t);
+            // Update hover state
+            let target = if resp.hovered() { 1.0 } else { 0.0 };
+            self.category_hover[i] = lerp_f32(self.category_hover[i], target, 0.15);
+            ui.add_space(4.0);
+        }
     }
 
     fn render_category_row(ui: &mut egui::Ui, cat: &mut CategoryState, hover_t: f32) -> egui::Response {
@@ -1492,35 +1472,19 @@ impl TidyMacApp {
                             },
                         );
 
-                        // Color bar with gradient + highlight
+                        // Color bar with highlight
                         let (bar_rect, _) = ui.allocate_exact_size(
                             egui::vec2(bar_w, bar_h),
                             egui::Sense::hover(),
                         );
                         let painter = ui.painter();
-                        let lighter = lerp_color(*color, egui::Color32::WHITE, 0.25);
-                        let steps = 10.min(bar_w as usize);
-                        if steps > 0 {
-                            let slice_w = bar_w / steps as f32;
-                            for s in 0..steps {
-                                let t = s as f32 / steps as f32;
-                                let c = lerp_color(lighter, *color, t);
-                                let x = bar_rect.min.x + s as f32 * slice_w;
-                                let slice = egui::Rect::from_min_size(
-                                    egui::pos2(x, bar_rect.min.y),
-                                    egui::vec2(slice_w + 1.0, bar_h),
-                                );
-                                painter.rect_filled(slice, 0.0, c);
-                            }
-                            // Top highlight
-                            let hl = egui::Rect::from_min_size(
-                                bar_rect.min,
-                                egui::vec2(bar_w, bar_h * 0.4),
-                            );
-                            painter.rect_filled(hl, 3.0, egui::Color32::from_white_alpha(15));
-                        } else {
-                            painter.rect_filled(bar_rect, 3.0, *color);
-                        }
+                        painter.rect_filled(bar_rect, 3.0, *color);
+                        // Top highlight for 3D effect
+                        let hl = egui::Rect::from_min_size(
+                            bar_rect.min,
+                            egui::vec2(bar_w, bar_h * 0.4),
+                        );
+                        painter.rect_filled(hl, 3.0, egui::Color32::from_white_alpha(15));
 
                         // Size on the right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2123,19 +2087,15 @@ impl TidyMacApp {
         // App list
         let max_size = self.analyzer_apps.first().map(|a| a.total_size).unwrap_or(1);
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for i in 0..self.analyzer_apps.len() {
-                    Self::render_app_row(
-                        ui,
-                        &self.analyzer_apps[i],
-                        &mut self.analyzer_expanded[i],
-                        max_size,
-                    );
-                    ui.add_space(3.0);
-                }
-            });
+        for i in 0..self.analyzer_apps.len() {
+            Self::render_app_row(
+                ui,
+                &self.analyzer_apps[i],
+                &mut self.analyzer_expanded[i],
+                max_size,
+            );
+            ui.add_space(3.0);
+        }
     }
 
     fn render_app_row(
@@ -2433,14 +2393,15 @@ impl TidyMacApp {
                     ui.ctx().request_repaint();
                 }
 
-                // Memory bar with gradient
+                // Memory bar
                 let bar_height = 10.0;
+                let rounding = 5.0;
                 let (bar_rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), bar_height),
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter();
-                painter.rect_filled(bar_rect, 5.0, egui::Color32::from_rgb(40, 40, 55));
+                painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(40, 40, 55));
 
                 let used_width = bar_rect.width() * pct;
                 let mem_color = if pct < 0.6 {
@@ -2451,32 +2412,24 @@ impl TidyMacApp {
                     egui::Color32::from_rgb(220, 60, 60)
                 };
 
-                if used_width > 1.0 {
-                    let color_start = lerp_color(GREEN, mem_color, 0.3);
-                    let steps = 16;
-                    let slice_w = used_width / steps as f32;
-                    for s in 0..steps {
-                        let t = s as f32 / steps as f32;
-                        let color = lerp_color(color_start, mem_color, t);
-                        let x = bar_rect.min.x + s as f32 * slice_w;
-                        let slice = egui::Rect::from_min_size(
-                            egui::pos2(x, bar_rect.min.y),
-                            egui::vec2(slice_w + 1.0, bar_height),
-                        );
-                        painter.rect_filled(slice, 0.0, color);
-                    }
+                if used_width > 2.0 {
+                    let used_rect = egui::Rect::from_min_size(
+                        bar_rect.min,
+                        egui::vec2(used_width, bar_height),
+                    );
+                    let right_r = if pct > 0.95 { rounding } else { 0.0 };
+                    let fill_rounding = egui::CornerRadius {
+                        nw: rounding as u8, sw: rounding as u8,
+                        ne: right_r as u8, se: right_r as u8,
+                    };
+                    painter.rect_filled(used_rect, fill_rounding, mem_color);
+
                     // Highlight
                     let hl = egui::Rect::from_min_size(
                         bar_rect.min,
                         egui::vec2(used_width, bar_height * 0.4),
                     );
-                    painter.rect_filled(hl, 5.0, egui::Color32::from_white_alpha(15));
-                    // Clean edge
-                    let used_rect = egui::Rect::from_min_size(
-                        bar_rect.min,
-                        egui::vec2(used_width, bar_height),
-                    );
-                    painter.rect_stroke(used_rect, 5.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 55)), egui::epaint::StrokeKind::Outside);
+                    painter.rect_filled(hl, fill_rounding, egui::Color32::from_white_alpha(15));
                 }
 
                 ui.add_space(4.0);
@@ -2822,17 +2775,40 @@ impl eframe::App for TidyMacApp {
 
                 match self.view_mode {
                     ViewMode::Main => {
+                        // Fixed header area (no scroll)
                         self.render_header(ui);
                         self.render_disk_bar(ui);
                         self.render_ram_optimizer(ui);
                         self.render_action_bar(ui);
-                        self.render_scan_dashboard(ui);
-                        self.render_category_list(ui);
-                        self.render_summary(ui);
-                        self.render_errors(ui);
+
+                        // Scrollable content area for scan results
+                        let available = ui.available_height();
+                        if available > 40.0 {
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_rgb(22, 22, 32))
+                                .corner_radius(egui::CornerRadius::same(10))
+                                .stroke(egui::Stroke::new(0.5, BORDER))
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .max_height(available - 20.0)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            self.render_scan_dashboard(ui);
+                                            self.render_category_list(ui);
+                                            self.render_summary(ui);
+                                            self.render_errors(ui);
+                                        });
+                                });
+                        }
                     }
                     ViewMode::Analyzer => {
-                        self.render_analyzer_view(ui);
+                        // Analyzer gets full scroll since it has its own header
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.render_analyzer_view(ui);
+                            });
                     }
                 }
             });

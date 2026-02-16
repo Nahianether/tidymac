@@ -1,41 +1,48 @@
 use crate::cleaner::{Cleaner, ScanEntry, ScanResult};
 use crate::utils;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use walkdir::WalkDir;
 
 /// Languages to always keep.
 const KEEP_LPROJ: &[&str] = &["en.lproj", "Base.lproj", "en_US.lproj"];
 
+/// Max depth inside /Applications (app bundle is ~3 levels deep for Resources).
+const MAX_DEPTH: usize = 6;
+
 pub struct LanguageFiles;
 
-/// Detect the user's system language (e.g. "en", "ja", "de").
-fn system_languages() -> HashSet<String> {
-    let mut langs = HashSet::new();
-    // Always keep English
-    langs.insert("en".to_string());
+/// Cached system language detection — only runs `defaults read` once per process.
+static SYSTEM_LANGS: OnceLock<HashSet<String>> = OnceLock::new();
 
-    // Read macOS preferred languages
-    if let Ok(output) = std::process::Command::new("defaults")
-        .args(["read", "NSGlobalDomain", "AppleLanguages"])
-        .output()
-    {
-        if let Ok(text) = String::from_utf8(output.stdout) {
-            // Output looks like: ( "en-US", "ja-JP", ... )
-            for line in text.lines() {
-                let trimmed = line.trim().trim_matches(|c| c == '"' || c == ',' || c == '(' || c == ')');
-                if !trimmed.is_empty() {
-                    // "en-US" -> "en"
-                    if let Some(lang) = trimmed.split('-').next() {
-                        langs.insert(lang.to_string());
+fn system_languages() -> &'static HashSet<String> {
+    SYSTEM_LANGS.get_or_init(|| {
+        let mut langs = HashSet::new();
+        // Always keep English
+        langs.insert("en".to_string());
+
+        // Read macOS preferred languages
+        if let Ok(output) = std::process::Command::new("defaults")
+            .args(["read", "NSGlobalDomain", "AppleLanguages"])
+            .output()
+        {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                for line in text.lines() {
+                    let trimmed = line
+                        .trim()
+                        .trim_matches(|c| c == '"' || c == ',' || c == '(' || c == ')');
+                    if !trimmed.is_empty() {
+                        if let Some(lang) = trimmed.split('-').next() {
+                            langs.insert(lang.to_string());
+                        }
+                        langs.insert(trimmed.replace('-', "_"));
                     }
-                    // Also keep the full code: "en-US" -> "en_US"
-                    langs.insert(trimmed.replace('-', "_"));
                 }
             }
         }
-    }
 
-    langs
+        langs
+    })
 }
 
 impl Cleaner for LanguageFiles {
@@ -56,11 +63,16 @@ impl Cleaner for LanguageFiles {
 
         let apps_dir = std::path::Path::new("/Applications");
         if !apps_dir.exists() {
-            return ScanResult { entries, total_bytes, errors };
+            return ScanResult {
+                entries,
+                total_bytes,
+                errors,
+            };
         }
 
-        // Walk /Applications looking for .lproj directories inside .app bundles
+        // Walk /Applications with depth limit
         for entry in WalkDir::new(apps_dir)
+            .max_depth(MAX_DEPTH)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -68,7 +80,7 @@ impl Cleaner for LanguageFiles {
             let path = entry.path();
 
             // Only look at directories ending in .lproj
-            if !path.is_dir() {
+            if !entry.file_type().is_dir() {
                 continue;
             }
             let name = match path.file_name().and_then(|n| n.to_str()) {
@@ -116,7 +128,11 @@ impl Cleaner for LanguageFiles {
 
         entries.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
-        ScanResult { entries, total_bytes, errors }
+        ScanResult {
+            entries,
+            total_bytes,
+            errors,
+        }
     }
 
     fn clean(&self, dry_run: bool) -> ScanResult {

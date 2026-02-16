@@ -9,6 +9,38 @@ const MIN_SIZE: u64 = 10_485_760;
 /// Minimum age: 180 days (6 months)
 const MIN_AGE_DAYS: u64 = 180;
 
+/// Maximum walk depth.
+const MAX_DEPTH: usize = 8;
+
+/// Directories to skip.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".Trash",
+    "__pycache__",
+    ".tox",
+    "target",
+    ".cargo",
+    ".rustup",
+];
+
+/// Bundle extensions to skip.
+const SKIP_EXTENSIONS: &[&str] = &[
+    ".app",
+    ".photoslibrary",
+    ".musiclibrary",
+    ".vmwarevm",
+    ".parallels",
+];
+
+fn should_skip_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SKIP_DIRS.iter().any(|&skip| name == skip)
+        || SKIP_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
 pub struct OldFiles;
 
 impl Cleaner for OldFiles {
@@ -23,7 +55,7 @@ impl Cleaner for OldFiles {
     fn scan(&self) -> ScanResult {
         let mut entries = Vec::new();
         let mut total_bytes = 0u64;
-        let mut errors = Vec::new();
+        let errors = Vec::new();
 
         let home = utils::home_dir();
         let dirs_to_scan = [
@@ -42,21 +74,26 @@ impl Cleaner for OldFiles {
             }
 
             for entry in WalkDir::new(dir)
+                .max_depth(MAX_DEPTH)
                 .follow_links(false)
                 .into_iter()
+                .filter_entry(|e| {
+                    if e.file_type().is_dir() {
+                        let name = e.file_name().to_string_lossy();
+                        return !should_skip_dir(&name);
+                    }
+                    true
+                })
                 .filter_map(|e| e.ok())
             {
-                let path = entry.path();
-                if !path.is_file() {
+                if !entry.file_type().is_file() {
                     continue;
                 }
 
-                let meta = match path.metadata() {
+                // Single metadata call — get size + timestamps at once
+                let meta = match entry.metadata() {
                     Ok(m) => m,
-                    Err(e) => {
-                        errors.push(format!("Cannot read {}: {e}", path.display()));
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
 
                 let size = meta.len();
@@ -76,7 +113,7 @@ impl Cleaner for OldFiles {
 
                 total_bytes += size;
                 entries.push(ScanEntry {
-                    path: path.to_path_buf(),
+                    path: entry.path().to_path_buf(),
                     size_bytes: size,
                 });
             }
