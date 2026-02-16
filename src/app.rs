@@ -42,6 +42,30 @@ fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     )
 }
 
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> egui::Color32 {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    egui::Color32::from_rgb(
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
+
 // ── Icon mapping ───────────────────────────────────────────────────────
 
 fn icon_for_category(name: &str) -> (&'static str, egui::Color32) {
@@ -147,6 +171,7 @@ pub enum BgMessage {
     AllCleansComplete,
     AllShredsComplete,
     Progress(String),
+    AnalyzerProgress(usize, usize, String),
     AnalyzerComplete(Vec<AppInfo>),
     RamOptimizeComplete(u64, u64),
     RamOptimizeError(String),
@@ -188,9 +213,20 @@ pub struct TidyMacApp {
     monitor: Option<Monitor>,
     monitor_enabled: bool,
     view_mode: ViewMode,
+    // Persistent system info for accurate readings
+    sys_info: sysinfo::System,
+    sys_networks: sysinfo::Networks,
+    sys_last_tick: std::time::Instant,
+    cpu_usage: f32,
+    net_rx_rate: f64,
+    net_tx_rate: f64,
     analyzer_apps: Vec<AppInfo>,
     analyzer_expanded: Vec<bool>,
     analyzer_scanning: bool,
+    analyzer_progress: usize,
+    analyzer_total: usize,
+    analyzer_current: String,
+    analyzer_hover: Vec<f32>,
     ram_optimizing: bool,
     ram_before: Option<(u64, u64)>,
     ram_after: Option<(u64, u64)>,
@@ -316,9 +352,24 @@ impl TidyMacApp {
             monitor: None,
             monitor_enabled: false,
             view_mode: ViewMode::Main,
+            sys_info: {
+                let mut s = sysinfo::System::new();
+                s.refresh_memory();
+                s.refresh_cpu_usage();
+                s
+            },
+            sys_networks: sysinfo::Networks::new_with_refreshed_list(),
+            sys_last_tick: std::time::Instant::now(),
+            cpu_usage: 0.0,
+            net_rx_rate: 0.0,
+            net_tx_rate: 0.0,
             analyzer_apps: vec![],
             analyzer_expanded: vec![],
             analyzer_scanning: false,
+            analyzer_progress: 0,
+            analyzer_total: 0,
+            analyzer_current: String::new(),
+            analyzer_hover: vec![],
             ram_optimizing: false,
             ram_before: None,
             ram_after: None,
@@ -548,10 +599,19 @@ impl TidyMacApp {
                             mon.refresh();
                         }
                     }
+                    BgMessage::AnalyzerProgress(done, total, name) => {
+                        self.analyzer_progress = done;
+                        self.analyzer_total = total;
+                        self.analyzer_current = name;
+                    }
                     BgMessage::AnalyzerComplete(apps) => {
                         self.analyzer_expanded = vec![false; apps.len()];
+                        self.analyzer_hover = vec![0.0; apps.len()];
                         self.analyzer_apps = apps;
                         self.analyzer_scanning = false;
+                        self.analyzer_progress = 0;
+                        self.analyzer_total = 0;
+                        self.analyzer_current.clear();
                         self.progress_label.clear();
                     }
                     BgMessage::RamOptimizeComplete(used, total) => {
@@ -1927,50 +1987,88 @@ impl TidyMacApp {
         self.analyzer_scanning = true;
         self.analyzer_apps.clear();
         self.analyzer_expanded.clear();
-        self.progress_label = "Scanning applications...".to_string();
+        self.analyzer_hover.clear();
+        self.analyzer_progress = 0;
+        self.analyzer_total = 0;
+        self.analyzer_current.clear();
 
         let (tx, rx) = mpsc::channel::<BgMessage>();
         self.receiver = Some(rx);
 
         std::thread::spawn(move || {
-            let progress = |msg: &str| {
-                let _ = tx.send(BgMessage::Progress(msg.to_string()));
-            };
-            let apps = crate::analyzer::scan_applications(&progress);
+            let tx_ref = &tx;
+            let apps = crate::analyzer::scan_applications(|done, total, name| {
+                let _ = tx_ref.send(BgMessage::AnalyzerProgress(done, total, name.to_string()));
+            });
             let _ = tx.send(BgMessage::AnalyzerComplete(apps));
         });
     }
 
     fn render_analyzer_view(&mut self, ui: &mut egui::Ui) {
-        // Header
-        ui.add_space(8.0);
+        // ── Header card ──
+        ui.add_space(6.0);
+        egui::Frame::NONE
+            .fill(CARD_FILL)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(0.5, BORDER))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                ui.horizontal(|ui| {
+                    // Back button
+                    let back_btn = egui::Button::new(
+                        egui::RichText::new("<  Back")
+                            .size(12.0)
+                            .color(ACCENT),
+                    )
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .min_size(egui::vec2(70.0, 28.0));
+                    if ui.add(back_btn).clicked() {
+                        self.view_mode = ViewMode::Main;
+                        self.view_alpha = 0.0;
+                    }
+
+                    ui.add_space(10.0);
+
+                    // Icon badge
+                    let badge_size = 32.0;
+                    let (badge_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(badge_size, badge_size),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(badge_rect, 8.0, egui::Color32::from_rgb(50, 80, 130));
+                    painter.text(
+                        badge_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "A",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::WHITE,
+                    );
+
+                    ui.add_space(8.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("App Size Analyzer")
+                                .size(18.0)
+                                .strong()
+                                .color(TITLE_BLUE),
+                        );
+                        ui.label(
+                            egui::RichText::new("Analyze application bundles in /Applications")
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                    });
+                });
+            });
+
+        ui.add_space(6.0);
+
+        // ── Action bar ──
         ui.horizontal(|ui| {
-            let back_btn = egui::Button::new(
-                egui::RichText::new("<  Back")
-                    .size(13.0)
-                    .color(ACCENT),
-            )
-            .corner_radius(egui::CornerRadius::same(6))
-            .min_size(egui::vec2(80.0, 30.0));
-            if ui.add(back_btn).clicked() {
-                self.view_mode = ViewMode::Main;
-                self.view_alpha = 0.0; // trigger fade-in
-            }
-
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("App Size Analyzer")
-                    .size(22.0)
-                    .strong()
-                    .color(TITLE_BLUE),
-            );
-        });
-
-        ui.add_space(8.0);
-
-        // Scan button
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
             let scan_btn = egui::Button::new(
                 egui::RichText::new("Scan Applications")
                     .size(14.0)
@@ -1983,118 +2081,289 @@ impl TidyMacApp {
                 egui::Color32::from_rgb(45, 120, 200)
             })
             .corner_radius(egui::CornerRadius::same(8))
-            .min_size(egui::vec2(160.0, 34.0));
+            .min_size(egui::vec2(170.0, 36.0));
 
             if ui.add_enabled(!self.analyzer_scanning, scan_btn).clicked() {
                 self.start_analyzer_scan();
             }
-
-            if !self.analyzer_apps.is_empty() {
-                ui.add_space(12.0);
-                let total: u64 = self.analyzer_apps.iter().map(|a| a.total_size).sum();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} apps  |  Total: {}",
-                        self.analyzer_apps.len(),
-                        utils::format_size(total)
-                    ))
-                    .size(12.0)
-                    .color(TEXT_SECONDARY),
-                );
-            }
         });
 
-        // Custom indeterminate progress bar
+        // ── Scanning progress ──
         if self.analyzer_scanning {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                let bar_height = 14.0;
-                let bar_width = ui.available_width() - 16.0;
-                let (bar_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(bar_width, bar_height),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter();
-                painter.rect_filled(bar_rect, 7.0, egui::Color32::from_rgb(35, 35, 50));
+            egui::Frame::NONE
+                .fill(CARD_FILL)
+                .corner_radius(egui::CornerRadius::same(8))
+                .stroke(egui::Stroke::new(0.5, BORDER))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
 
-                // Indeterminate sliding highlight
-                let time = ui.input(|i| i.time) as f32;
-                let cycle = (time * 0.5).fract();
-                let blob_w = bar_width * 0.35;
-                let blob_x = bar_rect.min.x + cycle * (bar_width + blob_w) - blob_w;
-                let blob_left = blob_x.max(bar_rect.min.x);
-                let blob_right = (blob_x + blob_w).min(bar_rect.max.x);
-                if blob_right > blob_left {
-                    let blob_rect = egui::Rect::from_min_max(
-                        egui::pos2(blob_left, bar_rect.min.y),
-                        egui::pos2(blob_right, bar_rect.max.y),
+                    // Progress info
+                    let (done, total) = (self.analyzer_progress, self.analyzer_total);
+                    let frac = if total > 0 {
+                        done as f32 / total as f32
+                    } else {
+                        0.0
+                    };
+                    self.anim_progress = lerp_f32(self.anim_progress, frac, 0.12);
+                    let anim_frac = self.anim_progress;
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Analyzing")
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if total > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("{} / {} apps", done, total))
+                                        .size(11.0)
+                                        .color(TEXT_SECONDARY),
+                                );
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Progress bar with per-corner rounding
+                    let bar_height = 12.0;
+                    let rounding = 6.0;
+                    let (bar_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), bar_height),
+                        egui::Sense::hover(),
                     );
-                    // Gradient blob
-                    let steps = 12;
-                    let sw = (blob_right - blob_left) / steps as f32;
-                    for s in 0..steps {
-                        let t = s as f32 / steps as f32;
-                        // Fade in then fade out
-                        let alpha = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
-                        let color = lerp_color(
-                            egui::Color32::from_rgb(35, 35, 50),
-                            ACCENT,
-                            alpha * 0.8,
+                    let painter = ui.painter();
+                    painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(35, 35, 50));
+
+                    let filled_w = bar_rect.width() * anim_frac;
+                    if filled_w > 2.0 {
+                        let filled_rect = egui::Rect::from_min_size(
+                            bar_rect.min,
+                            egui::vec2(filled_w, bar_height),
                         );
-                        let x = blob_rect.min.x + s as f32 * sw;
-                        let slice = egui::Rect::from_min_size(
-                            egui::pos2(x, blob_rect.min.y),
-                            egui::vec2(sw + 1.0, bar_height),
+                        let right_r = if anim_frac > 0.95 { rounding } else { 0.0 };
+                        let fill_rounding = egui::CornerRadius {
+                            nw: rounding as u8, sw: rounding as u8,
+                            ne: right_r as u8, se: right_r as u8,
+                        };
+                        painter.rect_filled(filled_rect, fill_rounding, ACCENT);
+
+                        // Highlight
+                        let hl = egui::Rect::from_min_size(
+                            bar_rect.min,
+                            egui::vec2(filled_w, bar_height * 0.4),
                         );
-                        painter.rect_filled(slice, 0.0, color);
+                        painter.rect_filled(hl, fill_rounding, egui::Color32::from_white_alpha(18));
                     }
-                    // Highlight
-                    let hl = egui::Rect::from_min_size(
-                        blob_rect.min,
-                        egui::vec2(blob_right - blob_left, bar_height * 0.4),
-                    );
-                    painter.rect_filled(hl, 7.0, egui::Color32::from_white_alpha(12));
-                }
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                let time = ui.input(|i| i.time);
-                let dots: String = ".".repeat((time * 3.0) as usize % 4);
-                ui.label(
-                    egui::RichText::new(format!("{}{}", self.progress_label, dots))
-                        .size(12.0)
-                        .color(TEXT_SECONDARY),
-                );
-            });
+
+                    // Current app name
+                    if !self.analyzer_current.is_empty() {
+                        ui.add_space(4.0);
+                        let time = ui.input(|i| i.time);
+                        let dots: String = ".".repeat((time * 3.0) as usize % 4);
+                        ui.label(
+                            egui::RichText::new(format!("{}{}", self.analyzer_current, dots))
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                    }
+                });
         }
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
+        // ── Empty state ──
         if self.analyzer_apps.is_empty() && !self.analyzer_scanning {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.label(
-                    egui::RichText::new("Click \"Scan Applications\" to analyze app sizes")
-                        .size(14.0)
-                        .color(TEXT_SECONDARY),
-                );
-            });
+            egui::Frame::NONE
+                .fill(CARD_FILL)
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(egui::Stroke::new(0.5, BORDER))
+                .inner_margin(egui::Margin::symmetric(14, 40))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("A")
+                                .size(36.0)
+                                .color(egui::Color32::from_rgb(60, 60, 80)),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Click \"Scan Applications\" to analyze app sizes")
+                                .size(13.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                    });
+                });
             return;
         }
 
-        // App list
-        let max_size = self.analyzer_apps.first().map(|a| a.total_size).unwrap_or(1);
+        // ── Summary stats card ──
+        if !self.analyzer_apps.is_empty() {
+            let total_size: u64 = self.analyzer_apps.iter().map(|a| a.total_size).sum();
+            let total_bin: u64 = self.analyzer_apps.iter().map(|a| a.binary_size).sum();
+            let total_res: u64 = self.analyzer_apps.iter().map(|a| a.resources_size).sum();
+            let total_fw: u64 = self.analyzer_apps.iter().map(|a| a.frameworks_size).sum();
+            let total_plug: u64 = self.analyzer_apps.iter().map(|a| a.plugins_size).sum();
+            let total_other: u64 = self.analyzer_apps.iter().map(|a| a.other_size).sum();
 
-        for i in 0..self.analyzer_apps.len() {
-            Self::render_app_row(
-                ui,
-                &self.analyzer_apps[i],
-                &mut self.analyzer_expanded[i],
-                max_size,
-            );
-            ui.add_space(3.0);
+            egui::Frame::NONE
+                .fill(CARD_FILL)
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(egui::Stroke::new(0.5, BORDER))
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} Applications", self.analyzer_apps.len()))
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT_PRIMARY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("Total: {}", utils::format_size(total_size)))
+                                    .size(14.0)
+                                    .strong()
+                                    .color(GREEN),
+                            );
+                        });
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Stacked summary bar
+                    let bar_height = 14.0;
+                    let rounding = 7.0;
+                    let (bar_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), bar_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(35, 35, 50));
+
+                    let segments: &[(u64, egui::Color32)] = &[
+                        (total_bin, egui::Color32::from_rgb(100, 160, 230)),
+                        (total_res, egui::Color32::from_rgb(80, 190, 120)),
+                        (total_fw, egui::Color32::from_rgb(220, 140, 60)),
+                        (total_plug, egui::Color32::from_rgb(160, 100, 220)),
+                        (total_other, egui::Color32::from_rgb(100, 100, 120)),
+                    ];
+
+                    if total_size > 0 {
+                        let mut x_offset = bar_rect.min.x;
+                        let seg_count = segments.len();
+                        for (idx, (seg_size, seg_color)) in segments.iter().enumerate() {
+                            if *seg_size == 0 {
+                                continue;
+                            }
+                            let seg_w = bar_rect.width() * (*seg_size as f32 / total_size as f32);
+                            if seg_w < 1.0 {
+                                continue;
+                            }
+                            let seg_rect = egui::Rect::from_min_size(
+                                egui::pos2(x_offset, bar_rect.min.y),
+                                egui::vec2(seg_w, bar_height),
+                            );
+                            // First segment: round left. Last visible: round right.
+                            let is_first = x_offset <= bar_rect.min.x + 1.0;
+                            let is_last = idx == seg_count - 1
+                                || (x_offset + seg_w) >= bar_rect.max.x - 1.0;
+                            let left_r = if is_first { rounding } else { 0.0 };
+                            let right_r = if is_last { rounding } else { 0.0 };
+                            let seg_rounding = egui::CornerRadius {
+                                nw: left_r as u8, sw: left_r as u8,
+                                ne: right_r as u8, se: right_r as u8,
+                            };
+                            painter.rect_filled(seg_rect, seg_rounding, *seg_color);
+                            x_offset += seg_w;
+                        }
+                    }
+
+                    ui.add_space(6.0);
+
+                    // Legend
+                    ui.horizontal_wrapped(|ui| {
+                        let legend = [
+                            ("Binary", egui::Color32::from_rgb(100, 160, 230), total_bin),
+                            ("Resources", egui::Color32::from_rgb(80, 190, 120), total_res),
+                            ("Frameworks", egui::Color32::from_rgb(220, 140, 60), total_fw),
+                            ("Plugins", egui::Color32::from_rgb(160, 100, 220), total_plug),
+                            ("Other", egui::Color32::from_rgb(100, 100, 120), total_other),
+                        ];
+                        for (label, color, size) in &legend {
+                            if *size == 0 {
+                                continue;
+                            }
+                            let dot_size = 8.0;
+                            let (dot_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(dot_size, dot_size),
+                                egui::Sense::hover(),
+                            );
+                            // Center vertically with text
+                            let centered = egui::Rect::from_center_size(
+                                egui::pos2(dot_rect.center().x, dot_rect.center().y + 1.0),
+                                egui::vec2(dot_size, dot_size),
+                            );
+                            ui.painter().rect_filled(centered, 2.0, *color);
+                            ui.label(
+                                egui::RichText::new(format!("{} {}", label, utils::format_size(*size)))
+                                    .size(10.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+
+            ui.add_space(6.0);
+        }
+
+        // ── Scrollable app list ──
+        let available = ui.available_height();
+        if available > 30.0 {
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgb(22, 22, 32))
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(egui::Stroke::new(0.5, BORDER))
+                .inner_margin(egui::Margin::symmetric(6, 6))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(available - 16.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let max_size = self.analyzer_apps.first().map(|a| a.total_size).unwrap_or(1);
+
+                            // Ensure hover vec matches
+                            if self.analyzer_hover.len() != self.analyzer_apps.len() {
+                                self.analyzer_hover = vec![0.0; self.analyzer_apps.len()];
+                            }
+
+                            for i in 0..self.analyzer_apps.len() {
+                                let hover_t = self.analyzer_hover[i];
+                                let resp = Self::render_app_row(
+                                    ui,
+                                    &self.analyzer_apps[i],
+                                    &mut self.analyzer_expanded[i],
+                                    max_size,
+                                    hover_t,
+                                );
+                                // Update hover animation
+                                let target = if resp.hovered() { 1.0 } else { 0.0 };
+                                self.analyzer_hover[i] = lerp_f32(self.analyzer_hover[i], target, 0.15);
+                                if (self.analyzer_hover[i] - target).abs() > 0.01 {
+                                    ui.ctx().request_repaint();
+                                }
+                                ui.add_space(3.0);
+                            }
+                        });
+                });
         }
     }
 
@@ -2103,42 +2372,48 @@ impl TidyMacApp {
         app: &AppInfo,
         expanded: &mut bool,
         max_size: u64,
-    ) {
-        let card_fill = if *expanded { CARD_EXPANDED } else { CARD_FILL };
+        hover_t: f32,
+    ) -> egui::Response {
+        let base_fill = if *expanded { CARD_EXPANDED } else { CARD_FILL };
+        let card_fill = lerp_color(base_fill, CARD_HOVER, hover_t);
+        let border_color = lerp_color(BORDER, BORDER_HOVER, hover_t);
 
-        egui::Frame::NONE
+        let resp = egui::Frame::NONE
             .fill(card_fill)
             .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .stroke(egui::Stroke::new(0.5, BORDER))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .stroke(egui::Stroke::new(0.5 + hover_t * 0.5, border_color))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
                 // Header row
                 ui.horizontal(|ui| {
-                    // App icon badge
-                    let badge_size = 26.0;
+                    // App icon badge with gradient
+                    let badge_size = 30.0;
                     let (badge_rect, _) = ui.allocate_exact_size(
                         egui::vec2(badge_size, badge_size),
                         egui::Sense::hover(),
                     );
                     let painter = ui.painter();
-                    painter.rect_filled(
-                        badge_rect,
-                        6.0,
-                        egui::Color32::from_rgb(60, 60, 80),
-                    );
+
+                    // Color based on app name hash for variety
+                    let hue = (app.name.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32)) % 360) as f32;
+                    let badge_color = hsv_to_rgb(hue, 0.4, 0.35);
+                    let text_color = hsv_to_rgb(hue, 0.3, 0.85);
+
+                    painter.rect_filled(badge_rect, 7.0, badge_color);
                     let initial = app.name.chars().next().unwrap_or('?');
                     painter.text(
                         badge_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        initial.to_string(),
-                        egui::FontId::proportional(13.0),
-                        ACCENT,
+                        initial.to_uppercase().to_string(),
+                        egui::FontId::proportional(14.0),
+                        text_color,
                     );
 
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
 
+                    // App name + arrow
                     let arrow = if *expanded { "\u{25BC}" } else { "\u{25B6}" };
                     if ui
                         .selectable_label(
@@ -2153,6 +2428,7 @@ impl TidyMacApp {
                         *expanded = !*expanded;
                     }
 
+                    // Size on right
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(utils::format_size(app.total_size))
@@ -2163,126 +2439,185 @@ impl TidyMacApp {
                     });
                 });
 
-                // Size bar
+                // Stacked size bar per app
+                let bar_height = 6.0;
                 let bar_frac = app.total_size as f32 / max_size as f32;
                 let bar_w = (ui.available_width() * bar_frac).max(4.0);
-                let (bar_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(bar_w, 6.0), egui::Sense::hover());
-                ui.painter().rect_filled(bar_rect, 3.0, ACCENT);
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(bar_w, bar_height),
+                    egui::Sense::hover(),
+                );
 
-                // Expanded breakdown
-                if !*expanded {
-                    return;
+                let painter = ui.painter();
+                if app.total_size > 0 {
+                    let segments: &[(u64, egui::Color32)] = &[
+                        (app.binary_size, egui::Color32::from_rgb(100, 160, 230)),
+                        (app.resources_size, egui::Color32::from_rgb(80, 190, 120)),
+                        (app.frameworks_size, egui::Color32::from_rgb(220, 140, 60)),
+                        (app.plugins_size, egui::Color32::from_rgb(160, 100, 220)),
+                        (app.other_size, egui::Color32::from_rgb(100, 100, 120)),
+                    ];
+                    let mut x = bar_rect.min.x;
+                    for (seg_size, seg_color) in segments {
+                        if *seg_size == 0 {
+                            continue;
+                        }
+                        let sw = bar_w * (*seg_size as f32 / app.total_size as f32);
+                        if sw < 1.0 {
+                            continue;
+                        }
+                        let seg_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, bar_rect.min.y),
+                            egui::vec2(sw, bar_height),
+                        );
+                        painter.rect_filled(seg_rect, 3.0, *seg_color);
+                        x += sw;
+                    }
+                } else {
+                    painter.rect_filled(bar_rect, 3.0, egui::Color32::from_rgb(50, 50, 65));
                 }
 
-                ui.add_space(6.0);
+                // ── Expanded breakdown ──
+                if *expanded {
+                    ui.add_space(6.0);
 
-                egui::Frame::NONE
-                    .fill(INSET_FILL)
-                    .corner_radius(egui::CornerRadius::same(6))
-                    .inner_margin(egui::Margin::symmetric(10, 8))
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
+                    egui::Frame::NONE
+                        .fill(INSET_FILL)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
 
-                        // Breakdown bars
-                        let parts = [
-                            ("Binary (MacOS)", app.binary_size, egui::Color32::from_rgb(100, 160, 230)),
-                            ("Resources", app.resources_size, egui::Color32::from_rgb(80, 190, 120)),
-                            ("Frameworks", app.frameworks_size, egui::Color32::from_rgb(220, 140, 60)),
-                            ("Other", app.other_size, egui::Color32::from_rgb(140, 140, 160)),
-                        ];
+                            let parts = [
+                                ("Binary (MacOS)", app.binary_size, egui::Color32::from_rgb(100, 160, 230)),
+                                ("Resources", app.resources_size, egui::Color32::from_rgb(80, 190, 120)),
+                                ("Frameworks", app.frameworks_size, egui::Color32::from_rgb(220, 140, 60)),
+                                ("Plugins / Helpers", app.plugins_size, egui::Color32::from_rgb(160, 100, 220)),
+                                ("Other", app.other_size, egui::Color32::from_rgb(100, 100, 120)),
+                            ];
 
-                        let part_max = parts
-                            .iter()
-                            .map(|(_, s, _)| *s)
-                            .max()
-                            .unwrap_or(1)
-                            .max(1);
+                            let part_max = parts
+                                .iter()
+                                .map(|(_, s, _)| *s)
+                                .max()
+                                .unwrap_or(1)
+                                .max(1);
 
-                        for (label, size, color) in &parts {
-                            if *size == 0 {
-                                continue;
-                            }
-                            ui.horizontal(|ui| {
+                            for (label, size, color) in &parts {
+                                if *size == 0 {
+                                    continue;
+                                }
+                                ui.horizontal(|ui| {
+                                    // Color dot
+                                    let dot_size = 8.0;
+                                    let (dot_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(dot_size, dot_size),
+                                        egui::Sense::hover(),
+                                    );
+                                    let centered = egui::Rect::from_center_size(
+                                        egui::pos2(dot_rect.center().x, dot_rect.center().y + 2.0),
+                                        egui::vec2(dot_size, dot_size),
+                                    );
+                                    ui.painter().rect_filled(centered, 2.0, *color);
+
+                                    ui.add_space(4.0);
+
+                                    // Label
+                                    ui.label(
+                                        egui::RichText::new(format!("{}", label))
+                                            .size(11.0)
+                                            .color(TEXT_SECONDARY),
+                                    );
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        // Percentage
+                                        let pct = if app.total_size > 0 {
+                                            *size as f32 / app.total_size as f32 * 100.0
+                                        } else {
+                                            0.0
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(format!("({:.0}%)", pct))
+                                                .size(10.0)
+                                                .color(egui::Color32::from_rgb(90, 90, 110)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(utils::format_size(*size))
+                                                .size(11.0)
+                                                .strong()
+                                                .color(*color),
+                                        );
+                                    });
+                                });
+
+                                // Mini bar
                                 let frac = *size as f32 / part_max as f32;
-                                let w = ((ui.available_width() - 120.0) * frac).max(4.0);
+                                let w = ((ui.available_width()) * frac).max(4.0);
                                 let (r, _) = ui.allocate_exact_size(
-                                    egui::vec2(w, 12.0),
+                                    egui::vec2(w, 4.0),
                                     egui::Sense::hover(),
                                 );
-                                ui.painter().rect_filled(r, 3.0, *color);
+                                ui.painter().rect_filled(r, 2.0, *color);
+                                ui.add_space(4.0);
+                            }
 
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}: {}",
-                                        label,
-                                        utils::format_size(*size)
-                                    ))
-                                    .size(11.0)
-                                    .color(TEXT_SECONDARY),
-                                );
+                            ui.add_space(4.0);
+
+                            // Action buttons
+                            ui.horizontal(|ui| {
+                                let reveal_btn = egui::Button::new(
+                                    egui::RichText::new("Reveal in Finder")
+                                        .size(11.0)
+                                        .color(ACCENT),
+                                )
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .min_size(egui::vec2(120.0, 26.0));
+                                if ui.add(reveal_btn).clicked() {
+                                    let _ = std::process::Command::new("open")
+                                        .arg("-R")
+                                        .arg(&app.path)
+                                        .spawn();
+                                }
+
+                                ui.add_space(8.0);
+
+                                let trash_btn = egui::Button::new(
+                                    egui::RichText::new("Move to Trash")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(220, 100, 100)),
+                                )
+                                .fill(egui::Color32::from_rgb(50, 30, 30))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .min_size(egui::vec2(120.0, 26.0));
+                                if ui
+                                    .add(trash_btn)
+                                    .on_hover_text("Move this app to Trash")
+                                    .clicked()
+                                {
+                                    let path_str = app.path.to_string_lossy().to_string();
+                                    let script = format!(
+                                        "tell application \"Finder\" to delete POSIX file \"{}\"",
+                                        path_str
+                                    );
+                                    let _ = std::process::Command::new("osascript")
+                                        .arg("-e")
+                                        .arg(&script)
+                                        .spawn();
+                                }
                             });
-                            ui.add_space(2.0);
-                        }
-
-                        ui.add_space(6.0);
-
-                        // Action buttons
-                        ui.horizontal(|ui| {
-                            let reveal_btn = egui::Button::new(
-                                egui::RichText::new("Reveal in Finder")
-                                    .size(11.0)
-                                    .color(ACCENT),
-                            )
-                            .corner_radius(egui::CornerRadius::same(4))
-                            .min_size(egui::vec2(110.0, 24.0));
-                            if ui.add(reveal_btn).clicked() {
-                                let _ = std::process::Command::new("open")
-                                    .arg("-R")
-                                    .arg(&app.path)
-                                    .spawn();
-                            }
-
-                            ui.add_space(8.0);
-
-                            let trash_btn = egui::Button::new(
-                                egui::RichText::new("Move to Trash")
-                                    .size(11.0)
-                                    .color(egui::Color32::from_rgb(220, 100, 100)),
-                            )
-                            .corner_radius(egui::CornerRadius::same(4))
-                            .min_size(egui::vec2(110.0, 24.0));
-                            if ui
-                                .add(trash_btn)
-                                .on_hover_text("Move this app to Trash")
-                                .clicked()
-                            {
-                                // Use macOS `trash` command via osascript
-                                let path_str = app.path.to_string_lossy().to_string();
-                                let script = format!(
-                                    "tell application \"Finder\" to delete POSIX file \"{}\"",
-                                    path_str
-                                );
-                                let _ = std::process::Command::new("osascript")
-                                    .arg("-e")
-                                    .arg(&script)
-                                    .spawn();
-                            }
                         });
-                    });
+                }
             });
+
+        resp.response
     }
 
-    fn get_memory_info() -> (u64, u64) {
-        use sysinfo::System;
-        let mut sys = System::new();
-        sys.refresh_memory();
-        (sys.used_memory(), sys.total_memory())
+    fn get_memory_info(&self) -> (u64, u64) {
+        (self.sys_info.used_memory(), self.sys_info.total_memory())
     }
 
     fn start_ram_optimize(&mut self) {
-        let (used, total) = Self::get_memory_info();
+        let (used, total) = self.get_memory_info();
         self.ram_before = Some((used, total));
         self.ram_after = None;
         self.ram_error = None;
@@ -2331,7 +2666,7 @@ impl TidyMacApp {
         });
     }
 
-    fn render_ram_optimizer(&mut self, ui: &mut egui::Ui) {
+    fn render_system_monitor(&mut self, ui: &mut egui::Ui) {
         egui::Frame::NONE
             .fill(CARD_FILL)
             .corner_radius(egui::CornerRadius::same(10))
@@ -2340,20 +2675,21 @@ impl TidyMacApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
+                // ── Header ──
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Memory")
+                        egui::RichText::new("System Monitor")
                             .size(12.0)
                             .strong()
                             .color(TEXT_PRIMARY),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Optimize button
+                        // Optimize memory button
                         let btn_label = if self.ram_optimizing {
                             "Optimizing..."
                         } else {
-                            "Optimize"
+                            "Optimize RAM"
                         };
                         let btn = egui::Button::new(
                             egui::RichText::new(btn_label)
@@ -2370,7 +2706,7 @@ impl TidyMacApp {
                             egui::Color32::from_rgb(45, 120, 200)
                         })
                         .corner_radius(egui::CornerRadius::same(6))
-                        .min_size(egui::vec2(80.0, 22.0));
+                        .min_size(egui::vec2(90.0, 22.0));
 
                         if ui.add_enabled(!self.ram_optimizing, btn).clicked() {
                             self.start_ram_optimize();
@@ -2380,75 +2716,173 @@ impl TidyMacApp {
 
                 ui.add_space(6.0);
 
-                // Current memory stats
-                let (used, total) = Self::get_memory_info();
-                let target_pct = if total > 0 {
-                    used as f32 / total as f32
-                } else {
-                    0.0
-                };
-                self.anim_mem_pct = lerp_f32(self.anim_mem_pct, target_pct, 0.08);
-                let pct = self.anim_mem_pct;
-                if (pct - target_pct).abs() > 0.001 {
-                    ui.ctx().request_repaint();
-                }
+                // ── Two-column layout: CPU + Memory ──
+                let half_width = (ui.available_width() - 8.0) / 2.0;
 
-                // Memory bar
-                let bar_height = 10.0;
-                let rounding = 5.0;
-                let (bar_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), bar_height),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter();
-                painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(40, 40, 55));
+                ui.horizontal(|ui| {
+                    // ── CPU column ──
+                    ui.vertical(|ui| {
+                        ui.set_width(half_width);
 
-                let used_width = bar_rect.width() * pct;
-                let mem_color = if pct < 0.6 {
-                    GREEN
-                } else if pct < 0.8 {
-                    YELLOW
-                } else {
-                    egui::Color32::from_rgb(220, 60, 60)
-                };
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("CPU")
+                                    .size(11.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let cpu_color = if self.cpu_usage < 50.0 {
+                                    GREEN
+                                } else if self.cpu_usage < 80.0 {
+                                    YELLOW
+                                } else {
+                                    egui::Color32::from_rgb(220, 60, 60)
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("{:.1}%", self.cpu_usage))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(cpu_color),
+                                );
+                            });
+                        });
 
-                if used_width > 2.0 {
-                    let used_rect = egui::Rect::from_min_size(
-                        bar_rect.min,
-                        egui::vec2(used_width, bar_height),
-                    );
-                    let right_r = if pct > 0.95 { rounding } else { 0.0 };
-                    let fill_rounding = egui::CornerRadius {
-                        nw: rounding as u8, sw: rounding as u8,
-                        ne: right_r as u8, se: right_r as u8,
-                    };
-                    painter.rect_filled(used_rect, fill_rounding, mem_color);
+                        // CPU bar
+                        let cpu_pct = (self.cpu_usage / 100.0).clamp(0.0, 1.0);
+                        let bar_height = 8.0;
+                        let rounding = 4.0;
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(half_width, bar_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(40, 40, 55));
 
-                    // Highlight
-                    let hl = egui::Rect::from_min_size(
-                        bar_rect.min,
-                        egui::vec2(used_width, bar_height * 0.4),
-                    );
-                    painter.rect_filled(hl, fill_rounding, egui::Color32::from_white_alpha(15));
-                }
+                        let filled_w = bar_rect.width() * cpu_pct;
+                        if filled_w > 2.0 {
+                            let cpu_color = if cpu_pct < 0.5 {
+                                GREEN
+                            } else if cpu_pct < 0.8 {
+                                YELLOW
+                            } else {
+                                egui::Color32::from_rgb(220, 60, 60)
+                            };
+                            let filled = egui::Rect::from_min_size(
+                                bar_rect.min,
+                                egui::vec2(filled_w, bar_height),
+                            );
+                            let right_r = if cpu_pct > 0.95 { rounding } else { 0.0 };
+                            let rnd = egui::CornerRadius {
+                                nw: rounding as u8, sw: rounding as u8,
+                                ne: right_r as u8, se: right_r as u8,
+                            };
+                            painter.rect_filled(filled, rnd, cpu_color);
+                        }
+                    });
 
-                ui.add_space(4.0);
+                    ui.add_space(8.0);
 
-                // Stats text
+                    // ── Memory column ──
+                    ui.vertical(|ui| {
+                        ui.set_width(half_width);
+
+                        let (used, total) = self.get_memory_info();
+                        let target_pct = if total > 0 {
+                            used as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        self.anim_mem_pct = lerp_f32(self.anim_mem_pct, target_pct, 0.08);
+                        let pct = self.anim_mem_pct;
+                        if (pct - target_pct).abs() > 0.001 {
+                            ui.ctx().request_repaint();
+                        }
+
+                        let mem_color = if pct < 0.6 {
+                            GREEN
+                        } else if pct < 0.8 {
+                            YELLOW
+                        } else {
+                            egui::Color32::from_rgb(220, 60, 60)
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Memory")
+                                    .size(11.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} / {} ({:.0}%)",
+                                        utils::format_size(used),
+                                        utils::format_size(total),
+                                        pct * 100.0,
+                                    ))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(mem_color),
+                                );
+                            });
+                        });
+
+                        // Memory bar
+                        let bar_height = 8.0;
+                        let rounding = 4.0;
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(half_width, bar_height),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(bar_rect, rounding, egui::Color32::from_rgb(40, 40, 55));
+
+                        let used_width = bar_rect.width() * pct;
+                        if used_width > 2.0 {
+                            let used_rect = egui::Rect::from_min_size(
+                                bar_rect.min,
+                                egui::vec2(used_width, bar_height),
+                            );
+                            let right_r = if pct > 0.95 { rounding } else { 0.0 };
+                            let fill_rounding = egui::CornerRadius {
+                                nw: rounding as u8, sw: rounding as u8,
+                                ne: right_r as u8, se: right_r as u8,
+                            };
+                            painter.rect_filled(used_rect, fill_rounding, mem_color);
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                // ── Network row ──
                 ui.horizontal(|ui| {
                     ui.label(
+                        egui::RichText::new("Network")
+                            .size(11.0)
+                            .color(TEXT_SECONDARY),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
                         egui::RichText::new(format!(
-                            "Used: {} / {}  ({:.0}%)",
-                            utils::format_size(used),
-                            utils::format_size(total),
-                            pct * 100.0,
+                            "\u{2191} {}",
+                            Self::format_rate(self.net_tx_rate),
                         ))
                         .size(11.0)
-                        .color(mem_color),
+                        .color(egui::Color32::from_rgb(100, 180, 240)),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "\u{2193} {}",
+                            Self::format_rate(self.net_rx_rate),
+                        ))
+                        .size(11.0)
+                        .color(GREEN),
                     );
                 });
 
-                // Before/after result
+                // Before/after RAM optimize result
                 if let (Some((before_used, _)), Some((after_used, _))) =
                     (self.ram_before, self.ram_after)
                 {
@@ -2457,18 +2891,11 @@ impl TidyMacApp {
                         ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(format!(
-                                "Freed: {}",
+                                "RAM freed: {}",
                                 utils::format_size(freed),
                             ))
                             .size(11.0)
                             .color(GREEN),
-                        );
-                    } else {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Memory already optimized")
-                                .size(11.0)
-                                .color(TEXT_SECONDARY),
                         );
                     }
                 }
@@ -2485,6 +2912,18 @@ impl TidyMacApp {
             });
 
         ui.add_space(6.0);
+    }
+
+    fn format_rate(bytes_per_sec: f64) -> String {
+        if bytes_per_sec < 1024.0 {
+            format!("{:.0} B/s", bytes_per_sec)
+        } else if bytes_per_sec < 1024.0 * 1024.0 {
+            format!("{:.1} KB/s", bytes_per_sec / 1024.0)
+        } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
+            format!("{:.1} MB/s", bytes_per_sec / (1024.0 * 1024.0))
+        } else {
+            format!("{:.2} GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
+        }
     }
 
     fn export_report(report: &[String], total_freed: u64) {
@@ -2713,6 +3152,29 @@ impl eframe::App for TidyMacApp {
             mon.tick();
         }
 
+        // Refresh system metrics every 2 seconds for accurate readings
+        if self.sys_last_tick.elapsed() >= std::time::Duration::from_secs(2) {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(self.sys_last_tick).as_secs_f64();
+
+            self.sys_info.refresh_cpu_usage();
+            self.cpu_usage = self.sys_info.global_cpu_usage();
+
+            self.sys_info.refresh_memory();
+
+            self.sys_networks.refresh(true);
+            if elapsed > 0.1 {
+                self.net_rx_rate = self.sys_networks.list().values()
+                    .map(|d| d.received()).sum::<u64>() as f64 / elapsed;
+                self.net_tx_rate = self.sys_networks.list().values()
+                    .map(|d| d.transmitted()).sum::<u64>() as f64 / elapsed;
+            }
+
+            self.sys_last_tick = now;
+            // Also refresh disk info periodically
+            self.disk_info = disk_info::get_disk_info();
+        }
+
         if self.phase != AppPhase::Idle || self.analyzer_scanning || self.ram_optimizing {
             ctx.request_repaint();
         }
@@ -2736,6 +3198,9 @@ impl eframe::App for TidyMacApp {
         if self.view_alpha < 0.99 {
             ctx.request_repaint();
         }
+
+        // Schedule repaint for live system metrics (every 2.5s)
+        ctx.request_repaint_after(std::time::Duration::from_millis(2500));
 
         // Detect dropped files
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -2778,7 +3243,7 @@ impl eframe::App for TidyMacApp {
                         // Fixed header area (no scroll)
                         self.render_header(ui);
                         self.render_disk_bar(ui);
-                        self.render_ram_optimizer(ui);
+                        self.render_system_monitor(ui);
                         self.render_action_bar(ui);
 
                         // Scrollable content area for scan results
@@ -2803,12 +3268,7 @@ impl eframe::App for TidyMacApp {
                         }
                     }
                     ViewMode::Analyzer => {
-                        // Analyzer gets full scroll since it has its own header
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.render_analyzer_view(ui);
-                            });
+                        self.render_analyzer_view(ui);
                     }
                 }
             });

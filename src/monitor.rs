@@ -1,3 +1,4 @@
+use sysinfo::{Networks, System};
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -8,7 +9,13 @@ pub struct Monitor {
     _tray: TrayIcon,
     disk_item: MenuItem,
     mem_item: MenuItem,
+    cpu_item: MenuItem,
+    net_item: MenuItem,
+    sys: System,
+    networks: Networks,
     last_update: std::time::Instant,
+    /// Track elapsed time between refreshes for accurate speed calculation.
+    last_net_time: std::time::Instant,
 }
 
 fn create_storage_icon() -> Icon {
@@ -57,26 +64,37 @@ fn create_storage_icon() -> Icon {
     Icon::from_rgba(rgba, size as u32, size as u32).expect("failed to create tray icon")
 }
 
-fn get_memory_info() -> (u64, u64) {
-    use sysinfo::System;
-    let mut sys = System::new();
-    sys.refresh_memory();
-    (sys.used_memory(), sys.total_memory())
+/// Format bytes-per-second into a human-readable rate string.
+fn format_rate(bytes_per_sec: f64) -> String {
+    if bytes_per_sec < 1024.0 {
+        format!("{:.0} B/s", bytes_per_sec)
+    } else if bytes_per_sec < 1024.0 * 1024.0 {
+        format!("{:.1} KB/s", bytes_per_sec / 1024.0)
+    } else if bytes_per_sec < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB/s", bytes_per_sec / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB/s", bytes_per_sec / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 impl Monitor {
     pub fn new() -> Option<Self> {
         let menu = Menu::new();
 
+        let app_label = MenuItem::new("TidyMac Monitor", false, None);
+        let separator = PredefinedMenuItem::separator();
         let disk_item = MenuItem::new("Disk: calculating...", false, None);
         let mem_item = MenuItem::new("Memory: calculating...", false, None);
-        let separator = PredefinedMenuItem::separator();
-        let app_label = MenuItem::new("TidyMac Monitor", false, None);
+        let cpu_item = MenuItem::new("CPU: calculating...", false, None);
+        let net_item = MenuItem::new("Net: calculating...", false, None);
 
         let _ = menu.append(&app_label);
         let _ = menu.append(&separator);
-        let _ = menu.append(&disk_item);
+        let _ = menu.append(&cpu_item);
         let _ = menu.append(&mem_item);
+        let _ = menu.append(&disk_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&net_item);
 
         let icon = create_storage_icon();
 
@@ -88,34 +106,44 @@ impl Monitor {
             .build()
             .ok()?;
 
+        // Initialize system with CPU baseline
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.refresh_cpu_usage(); // baseline — first reading will be inaccurate
+
+        // Initialize networks with baseline
+        let networks = Networks::new_with_refreshed_list();
+
+        let now = std::time::Instant::now();
         let mut monitor = Self {
             _tray: tray,
             disk_item,
             mem_item,
-            last_update: std::time::Instant::now()
-                - std::time::Duration::from_secs(60),
+            cpu_item,
+            net_item,
+            sys,
+            networks,
+            last_update: now - std::time::Duration::from_secs(60),
+            last_net_time: now,
         };
+        // Wait briefly then refresh for initial accurate CPU reading
+        std::thread::sleep(std::time::Duration::from_millis(200));
         monitor.refresh();
         Some(monitor)
     }
 
     pub fn refresh(&mut self) {
-        // Disk info
-        if let Some(info) = disk_info::get_disk_info() {
-            let pct = (info.usage_percent() * 100.0) as u32;
-            self.disk_item.set_text(format!(
-                "Disk: {} used / {} total ({}%)",
-                utils::format_size(info.used),
-                utils::format_size(info.total),
-                pct,
-            ));
-            // Shorter text for menu bar
-            let free = utils::format_size(info.available);
-            self._tray.set_title(Some(free));
-        }
+        let now = std::time::Instant::now();
 
-        // Memory info
-        let (used_mem, total_mem) = get_memory_info();
+        // ── CPU ──
+        self.sys.refresh_cpu_usage();
+        let cpu_usage = self.sys.global_cpu_usage();
+        self.cpu_item.set_text(format!("CPU: {:.1}%", cpu_usage));
+
+        // ── Memory ──
+        self.sys.refresh_memory();
+        let used_mem = self.sys.used_memory();
+        let total_mem = self.sys.total_memory();
         let mem_pct = if total_mem > 0 {
             (used_mem as f64 / total_mem as f64 * 100.0) as u32
         } else {
@@ -128,12 +156,44 @@ impl Monitor {
             mem_pct,
         ));
 
-        self.last_update = std::time::Instant::now();
+        // ── Disk ──
+        if let Some(info) = disk_info::get_disk_info() {
+            let pct = (info.usage_percent() * 100.0) as u32;
+            self.disk_item.set_text(format!(
+                "Disk: {} used / {} total ({}%)",
+                utils::format_size(info.used),
+                utils::format_size(info.total),
+                pct,
+            ));
+            let free = utils::format_size(info.available);
+            self._tray.set_title(Some(free));
+        }
+
+        // ── Network ──
+        let elapsed = now.duration_since(self.last_net_time).as_secs_f64();
+        self.networks.refresh(true);
+
+        let rx_bytes: u64 = self.networks.list().values().map(|d| d.received()).sum();
+        let tx_bytes: u64 = self.networks.list().values().map(|d| d.transmitted()).sum();
+
+        if elapsed > 0.1 {
+            let rx_rate = rx_bytes as f64 / elapsed;
+            let tx_rate = tx_bytes as f64 / elapsed;
+            self.net_item.set_text(format!(
+                "Net: \u{2191}{} \u{2193}{}",
+                format_rate(tx_rate),
+                format_rate(rx_rate),
+            ));
+        }
+
+        self.last_net_time = now;
+        self.last_update = now;
     }
 
-    /// Call this from the eframe update loop. Refreshes every 30 seconds.
+    /// Call this from the eframe update loop. Refreshes every 3 seconds
+    /// for responsive CPU and network readings.
     pub fn tick(&mut self) {
-        if self.last_update.elapsed() >= std::time::Duration::from_secs(30) {
+        if self.last_update.elapsed() >= std::time::Duration::from_secs(3) {
             self.refresh();
         }
     }
