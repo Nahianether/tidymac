@@ -43,6 +43,9 @@ fn icon_for_category(name: &str) -> (&'static str, egui::Color32) {
         "language-files" => ("i", egui::Color32::from_rgb(50, 180, 180)),
         "privacy" => ("R", egui::Color32::from_rgb(220, 70, 70)),
         "old-files" => ("O", egui::Color32::from_rgb(200, 160, 50)),
+        "broken-symlinks" => ("~", egui::Color32::from_rgb(180, 80, 80)),
+        "empty-folders" => ("E", egui::Color32::from_rgb(110, 110, 130)),
+        "screenshots" => ("Sc", egui::Color32::from_rgb(160, 90, 200)),
         "large-files" => ("F", egui::Color32::from_rgb(200, 80, 200)),
         _ => ("?", egui::Color32::from_rgb(140, 140, 160)),
     }
@@ -127,6 +130,8 @@ pub enum BgMessage {
     AllShredsComplete,
     Progress(String),
     AnalyzerComplete(Vec<AppInfo>),
+    RamOptimizeComplete(u64, u64),
+    RamOptimizeError(String),
 }
 
 #[derive(PartialEq)]
@@ -166,6 +171,10 @@ pub struct TidyMacApp {
     analyzer_apps: Vec<AppInfo>,
     analyzer_expanded: Vec<bool>,
     analyzer_scanning: bool,
+    ram_optimizing: bool,
+    ram_before: Option<(u64, u64)>,
+    ram_after: Option<(u64, u64)>,
+    ram_error: Option<String>,
 }
 
 // ── App impl ───────────────────────────────────────────────────────────
@@ -274,6 +283,10 @@ impl TidyMacApp {
             analyzer_apps: vec![],
             analyzer_expanded: vec![],
             analyzer_scanning: false,
+            ram_optimizing: false,
+            ram_before: None,
+            ram_after: None,
+            ram_error: None,
         }
     }
 
@@ -407,6 +420,14 @@ impl TidyMacApp {
                         self.analyzer_apps = apps;
                         self.analyzer_scanning = false;
                         self.progress_label.clear();
+                    }
+                    BgMessage::RamOptimizeComplete(used, total) => {
+                        self.ram_after = Some((used, total));
+                        self.ram_optimizing = false;
+                    }
+                    BgMessage::RamOptimizeError(err) => {
+                        self.ram_error = Some(err);
+                        self.ram_optimizing = false;
                     }
                 }
             }
@@ -1856,6 +1877,198 @@ impl TidyMacApp {
             });
     }
 
+    fn get_memory_info() -> (u64, u64) {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        (sys.used_memory(), sys.total_memory())
+    }
+
+    fn start_ram_optimize(&mut self) {
+        let (used, total) = Self::get_memory_info();
+        self.ram_before = Some((used, total));
+        self.ram_after = None;
+        self.ram_error = None;
+        self.ram_optimizing = true;
+
+        let (tx, rx) = mpsc::channel::<BgMessage>();
+        self.receiver = Some(rx);
+
+        std::thread::spawn(move || {
+            // Use osascript to run purge with admin privileges (native password prompt)
+            let result = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("do shell script \"purge\" with administrator privileges")
+                .output();
+
+            // Wait a moment for memory to settle
+            std::thread::sleep(std::time::Duration::from_secs(2));
+
+            match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        let mut sys = sysinfo::System::new();
+                        sys.refresh_memory();
+                        let _ = tx.send(BgMessage::RamOptimizeComplete(
+                            sys.used_memory(),
+                            sys.total_memory(),
+                        ));
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        let msg = if stderr.contains("User canceled") || stderr.contains("-128") {
+                            "Cancelled by user.".to_string()
+                        } else if stderr.is_empty() {
+                            format!("purge exited with code {}", output.status)
+                        } else {
+                            stderr
+                        };
+                        let _ = tx.send(BgMessage::RamOptimizeError(msg));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(BgMessage::RamOptimizeError(format!(
+                        "Failed to run purge: {e}"
+                    )));
+                }
+            }
+        });
+    }
+
+    fn render_ram_optimizer(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::NONE
+            .fill(CARD_FILL)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(0.5, BORDER))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Memory")
+                            .size(12.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Optimize button
+                        let btn_label = if self.ram_optimizing {
+                            "Optimizing..."
+                        } else {
+                            "Optimize"
+                        };
+                        let btn = egui::Button::new(
+                            egui::RichText::new(btn_label)
+                                .size(11.0)
+                                .color(if self.ram_optimizing {
+                                    TEXT_SECONDARY
+                                } else {
+                                    egui::Color32::WHITE
+                                }),
+                        )
+                        .fill(if self.ram_optimizing {
+                            egui::Color32::from_rgb(40, 40, 55)
+                        } else {
+                            egui::Color32::from_rgb(45, 120, 200)
+                        })
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .min_size(egui::vec2(80.0, 22.0));
+
+                        if ui.add_enabled(!self.ram_optimizing, btn).clicked() {
+                            self.start_ram_optimize();
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                // Current memory stats
+                let (used, total) = Self::get_memory_info();
+                let pct = if total > 0 {
+                    used as f32 / total as f32
+                } else {
+                    0.0
+                };
+
+                // Memory bar
+                let bar_height = 10.0;
+                let (bar_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), bar_height),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(bar_rect, 5.0, egui::Color32::from_rgb(40, 40, 55));
+
+                let used_width = bar_rect.width() * pct;
+                let used_rect = egui::Rect::from_min_size(
+                    bar_rect.min,
+                    egui::vec2(used_width, bar_height),
+                );
+                let mem_color = if pct < 0.6 {
+                    GREEN
+                } else if pct < 0.8 {
+                    YELLOW
+                } else {
+                    egui::Color32::from_rgb(220, 60, 60)
+                };
+                painter.rect_filled(used_rect, 5.0, mem_color);
+
+                ui.add_space(4.0);
+
+                // Stats text
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Used: {} / {}  ({:.0}%)",
+                            utils::format_size(used),
+                            utils::format_size(total),
+                            pct * 100.0,
+                        ))
+                        .size(11.0)
+                        .color(mem_color),
+                    );
+                });
+
+                // Before/after result
+                if let (Some((before_used, _)), Some((after_used, _))) =
+                    (self.ram_before, self.ram_after)
+                {
+                    let freed = before_used.saturating_sub(after_used);
+                    if freed > 0 {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Freed: {}",
+                                utils::format_size(freed),
+                            ))
+                            .size(11.0)
+                            .color(GREEN),
+                        );
+                    } else {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Memory already optimized")
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                    }
+                }
+
+                // Error
+                if let Some(ref err) = self.ram_error {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("[!] {err}"))
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(220, 100, 50)),
+                    );
+                }
+            });
+
+        ui.add_space(6.0);
+    }
+
     fn render_errors(&self, ui: &mut egui::Ui) {
         if self.errors.is_empty() {
             return;
@@ -1896,7 +2109,7 @@ impl eframe::App for TidyMacApp {
             mon.tick();
         }
 
-        if self.phase != AppPhase::Idle || self.analyzer_scanning {
+        if self.phase != AppPhase::Idle || self.analyzer_scanning || self.ram_optimizing {
             ctx.request_repaint();
         }
 
@@ -1918,6 +2131,7 @@ impl eframe::App for TidyMacApp {
                     ViewMode::Main => {
                         self.render_header(ui);
                         self.render_disk_bar(ui);
+                        self.render_ram_optimizer(ui);
                         self.render_action_bar(ui);
                         self.render_scan_dashboard(ui);
                         self.render_category_list(ui);

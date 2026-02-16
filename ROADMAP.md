@@ -305,6 +305,121 @@ The following features are planned for implementation, in order of priority.
 
 ---
 
+### Phase 10: RAM Optimizer
+
+**Goal:** One-click memory purge with before/after stats.
+
+**What it does:**
+- Shows current memory usage (used / total / pressure) in a card
+- "Optimize Memory" button runs macOS `purge` command (requires sudo or runs via `sudo purge`)
+- Displays before/after comparison: how much memory was freed
+- Integrates into the main view as a quick-action card below the disk bar
+
+**Implementation:**
+- In `src/app.rs`:
+  - New method `render_ram_optimizer()` — card with memory stats + optimize button
+  - Fields: `ram_before: Option<(u64, u64)>`, `ram_after: Option<(u64, u64)>`, `ram_optimizing: bool`
+  - Uses `sysinfo` crate (already a dependency) to read memory stats
+  - Background thread runs `purge` command, then reads memory again
+  - New `BgMessage::RamOptimizeComplete(u64, u64)` variant for after-stats
+- Memory reading via `sysinfo::System::refresh_memory()`
+- `purge` command: `std::process::Command::new("purge")` (may need elevated permissions — falls back gracefully with error message)
+
+**Dependencies:** None (uses existing `sysinfo` crate)
+
+---
+
+### Phase 11: Broken Symlinks Finder
+
+**Goal:** Find and remove dangling symbolic links across user directories.
+
+**What it does:**
+- Scans user directories for symbolic links whose targets no longer exist
+- Shows the symlink path and what it pointed to
+- Selectable for deletion like other categories
+- Typically left behind by uninstalled apps, moved files, or broken dev setups
+
+**Implementation:**
+- New file: `src/categories/broken_symlinks.rs`
+  - Struct `BrokenSymlinks`
+  - Implement `Cleaner` trait
+  - `scan()`: Walk `~/`, `~/Library/`, `/usr/local/` (with depth limits)
+    - For each entry, check `entry.path_is_symlink()`
+    - Then check if `std::fs::read_link(path)` target exists via `std::fs::metadata(target)`
+    - If target doesn't exist → broken symlink → add as `ScanEntry`
+    - Size is 0 for symlinks (they don't occupy real space, but clutter the filesystem)
+  - `clean()`: Remove selected broken symlinks via `std::fs::remove_file()`
+- Register in `src/categories/mod.rs`
+- Add icon mapping in `src/app.rs`: `"broken-symlinks" => ("~", gray-red color)`
+
+**Directories scanned:**
+- `~/Library/`
+- `/usr/local/bin/`, `/usr/local/lib/`
+- `~/bin/` (if exists)
+
+---
+
+### Phase 12: Empty Folders Cleaner
+
+**Goal:** Find and remove empty directories left behind by uninstalled apps or file operations.
+
+**What it does:**
+- Scans user directories for completely empty folders (no files, no subdirectories)
+- Also detects "effectively empty" folders (only contain `.DS_Store`)
+- Excludes system-required directories and hidden dot-directories
+- Selectable for deletion
+
+**Implementation:**
+- New file: `src/categories/empty_folders.rs`
+  - Struct `EmptyFolders`
+  - Implement `Cleaner` trait
+  - `scan()`: Walk common directories bottom-up
+    - For each directory, check if `std::fs::read_dir()` returns 0 entries, or only `.DS_Store`
+    - Skip protected paths: `~/Desktop`, `~/Documents`, `~/Downloads`, `~/Pictures`, `~/Music`, `~/Movies` (top-level only)
+    - Skip hidden directories (starting with `.`) except inside `~/Library/`
+    - Each empty folder is a `ScanEntry` with size 0
+  - `clean()`: Remove selected empty directories via `std::fs::remove_dir()` (safe — fails if not actually empty)
+- Register in `src/categories/mod.rs`
+- Add icon mapping in `src/app.rs`: `"empty-folders" => ("E", dim gray color)`
+
+**Directories scanned:**
+- `~/Library/Application Support/`
+- `~/Library/Caches/`
+- `~/Library/Containers/`
+- `~/Library/Preferences/` (subdirectories only)
+
+---
+
+### Phase 13: Screenshot Cleaner
+
+**Goal:** Detect and clean old macOS screenshots from Desktop.
+
+**What it does:**
+- Scans Desktop (and custom screenshot location) for macOS screenshot files
+- Detects files matching macOS screenshot naming: `Screenshot YYYY-MM-DD at HH.MM.SS.*` and `Screen Recording YYYY-MM-DD at HH.MM.SS.*`
+- Configurable age threshold: default 30 days (screenshots older than 30 days are marked)
+- Shows thumbnail-friendly file list with dates and sizes
+- Also checks custom screenshot save location via `defaults read com.apple.screencapture location`
+
+**Implementation:**
+- New file: `src/categories/screenshots.rs`
+  - Struct `Screenshots`
+  - Implement `Cleaner` trait
+  - `scan()`:
+    - Determine screenshot directory: check `defaults read com.apple.screencapture location`, fallback to `~/Desktop/`
+    - List files matching pattern: starts with `Screenshot ` or `Screen Recording `, extensions `.png`, `.jpg`, `.mov`, `.mp4`
+    - Filter by age: older than 30 days (based on file modification time)
+    - Each matching file is a `ScanEntry`
+  - `clean()`: Remove selected screenshot files
+- Register in `src/categories/mod.rs`
+- Add icon mapping in `src/app.rs`: `"screenshots" => ("S", purple color)` (use different shade than CoreSimulator)
+
+**Directories scanned:**
+- `~/Desktop/` (default)
+- Custom screenshot location (if configured via macOS settings)
+
+---
+
 ## Implementation Order
 
 | Phase | Feature | New Files | Estimated Scope |
@@ -318,3 +433,7 @@ The following features are planned for implementation, in order of priority.
 | 7 | Real-time Disk Monitor | `src/monitor.rs` or separate binary | Large — system tray integration |
 | 8 | Secure File Shredder | `src/shredder.rs` | Medium — file I/O + UI |
 | 9 | App Size Analyzer | `src/analyzer.rs` | Large — new view + scanning |
+| 10 | RAM Optimizer | UI in `src/app.rs` | Small — sysinfo + purge command |
+| 11 | Broken Symlinks Finder | `src/categories/broken_symlinks.rs` | Small — follows cleaner pattern |
+| 12 | Empty Folders Cleaner | `src/categories/empty_folders.rs` | Small — follows cleaner pattern |
+| 13 | Screenshot Cleaner | `src/categories/screenshots.rs` | Small — follows cleaner pattern |

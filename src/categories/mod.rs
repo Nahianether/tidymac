@@ -1,13 +1,16 @@
 mod app_logs;
+mod broken_symlinks;
 mod browser_caches;
 mod ds_store;
 mod duplicates;
+mod empty_folders;
 mod homebrew;
 mod language_files;
 mod large_files;
 mod old_files;
 mod privacy;
 mod package_managers;
+mod screenshots;
 mod system_caches;
 mod trash;
 mod xcode;
@@ -31,6 +34,9 @@ pub fn all_cleaners(min_size_bytes: u64, scan_path: Option<&str>) -> Vec<Box<dyn
         Box::new(duplicates::DuplicateFinder),
         Box::new(privacy::PrivacyCleaner),
         Box::new(old_files::OldFiles),
+        Box::new(broken_symlinks::BrokenSymlinks),
+        Box::new(empty_folders::EmptyFolders),
+        Box::new(screenshots::Screenshots),
         Box::new(large_files::LargeFiles::new(min_size_bytes, scan_path)),
     ]
 }
