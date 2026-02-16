@@ -13,9 +13,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("TidyMac")
-            .with_inner_size([600.0, 700.0])
-            .with_min_inner_size([600.0, 700.0])
-            .with_max_inner_size([600.0, 700.0]),
+            .with_inner_size([600.0, 800.0])
+            .with_min_inner_size([600.0, 800.0])
+            .with_max_inner_size([600.0, 800.0]),
         ..Default::default()
     };
 
